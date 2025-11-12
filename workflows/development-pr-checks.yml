@@ -1,0 +1,252 @@
+name: Reusable - Development PR Comprehensive Checks
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version"
+        required: false
+        default: "22"
+        type: string
+      service-name:
+        description: "Service name for Codecov flag"
+        required: true
+        type: string
+    secrets:
+      SDK_TOKEN:
+        required: true
+      CODECOV_TOKEN:
+        required: true
+
+jobs:
+  lint-test-coverage:
+    name: ESLint, Format & Test Coverage Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "npm"
+
+      - name: Configure npm for private packages
+        run: |
+          echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check for package vulnerabilities
+        id: audit
+        run: |
+          npm audit --audit-level=moderate
+          echo "✅ Security audit passed"
+        continue-on-error: true
+
+      - name: Run linting
+        run: npm run lint:check
+        continue-on-error: false
+
+      - name: Check code formatting
+        run: |
+          npm run format
+          if ! git diff --quiet; then
+            echo "❌ Code is not properly formatted. Run 'npm run format' locally."
+            git diff
+            exit 1
+          else
+            echo "✅ Code is properly formatted"
+          fi
+
+      - name: Run tests with coverage (PR)
+        id: test-cov-pr
+        run: npm run test:cov
+        continue-on-error: true
+
+      - name: Save PR coverage report
+        if: steps.test-cov-pr.outcome == 'success'
+        run: mv coverage/coverage-summary.json pr-coverage-summary.json
+
+      - name: Get development branch coverage
+        id: test-cov-dev
+        if: github.base_ref == 'development' && steps.test-cov-pr.outcome == 'success'
+        run: |
+          echo "Switching to development branch (TEMPORARY TEST)..."
+          git checkout development
+          npm ci
+          npm run test:cov
+          mv coverage/coverage-summary.json dev-coverage-summary.json
+          git checkout -
+        continue-on-error: true
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Parse Coverage Summaries
+        id: coverage
+        if: steps.test-cov-pr.outcome == 'success'
+        run: |
+          THRESHOLD=80
+          PR_SUMMARY_FILE="pr-coverage-summary.json"
+          BASE_SUMMARY_FILE="dev-coverage-summary.json"
+          
+          if [ ! -f "$PR_SUMMARY_FILE" ]; then
+            echo "❌ PR Coverage summary file not found!"
+            echo "status=fail" >> $GITHUB_OUTPUT
+            echo "message=PR Coverage summary not found." >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          LINES_PCT=$(jq '.total.lines.pct' $PR_SUMMARY_FILE)
+          STATEMENTS_PCT=$(jq '.total.statements.pct' $PR_SUMMARY_FILE)
+          FUNCTIONS_PCT=$(jq '.total.functions.pct' $PR_SUMMARY_FILE)
+          BRANCHES_PCT=$(jq '.total.branches.pct' $PR_SUMMARY_FILE)
+
+          IS_BELOW_THRESHOLD=$(echo "$LINES_PCT < $THRESHOLD" | bc)
+          
+          if [ "$IS_BELOW_THRESHOLD" -eq 1 ]; then
+            STATUS="❌ FAILED"
+            MESSAGE="Total coverage is ${LINES_PCT}%. Threshold of ${THRESHOLD}% was not met."
+            echo "status=fail" >> $GITHUB_OUTPUT
+          else
+            STATUS="✅ PASSED"
+            MESSAGE="Total coverage is ${LINES_PCT}%. Threshold of ${THRESHOLD}% was met."
+            echo "status=success" >> $GITHUB_OUTPUT
+          fi
+          
+          COMPARISON_MESSAGE=""
+          TABLE_BODY=""
+
+          if [ -f "$BASE_SUMMARY_FILE" ]; then
+            BASE_LINES_PCT=$(jq '.total.lines.pct' $BASE_SUMMARY_FILE)
+            BASE_STATEMENTS_PCT=$(jq '.total.statements.pct' $BASE_SUMMARY_FILE)
+            BASE_FUNCTIONS_PCT=$(jq '.total.functions.pct' $BASE_SUMMARY_FILE)
+            BASE_BRANCHES_PCT=$(jq '.total.branches.pct' $BASE_SUMMARY_FILE)
+            
+            WARNINGS=""
+
+            IS_LINES_LESS=$(echo "$LINES_PCT < $BASE_LINES_PCT" | bc)
+            if [ "$IS_LINES_LESS" -eq 1 ]; then
+              WARNINGS+="* **Lines** dropped: ${LINES_PCT}% (was ${BASE_LINES_PCT}%)\n"
+            fi
+
+            IS_STMTS_LESS=$(echo "$STATEMENTS_PCT < $BASE_STATEMENTS_PCT" | bc)
+            if [ "$IS_STMTS_LESS" -eq 1 ]; then
+              WARNINGS+="* **Statements** dropped: ${STATEMENTS_PCT}% (was ${BASE_STATEMENTS_PCT}%)\n"
+            fi
+
+            IS_FUNCS_LESS=$(echo "$FUNCTIONS_PCT < $BASE_FUNCTIONS_PCT" | bc)
+            if [ "$IS_FUNCS_LESS" -eq 1 ]; then
+              WARNINGS+="* **Functions** dropped: ${FUNCTIONS_PCT}% (was ${BASE_FUNCTIONS_PCT}%)\n"
+            fi
+
+            IS_BRANCHES_LESS=$(echo "$BRANCHES_PCT < $BASE_BRANCHES_PCT" | bc)
+            if [ "$IS_BRANCHES_LESS" -eq 1 ]; then
+              WARNINGS+="* **Branches** dropped: ${BRANCHES_PCT}% (was ${BASE_BRANCHES_PCT}%)\n"
+            fi
+            
+            if [ -z "$WARNINGS" ]; then
+              COMPARISON_MESSAGE="✅ **Coverage met or exceeded base branch on all metrics.**"
+            else
+              printf -v COMPARISON_MESSAGE "⚠️ **Warning: Coverage dropped in the following areas:**\n%b" "$WARNINGS"
+            fi
+
+            TABLE_BODY="
+            | Category | PR Percentage | Base Branch |
+            | --- | ---: | ---: |
+            | Lines | $LINES_PCT% | $BASE_LINES_PCT% |
+            | Statements | $STATEMENTS_PCT% | $BASE_STATEMENTS_PCT% |
+            | Functions | $FUNCTIONS_PCT% | $BASE_FUNCTIONS_PCT% |
+            | Branches | $BRANCHES_PCT% | $BASE_BRANCHES_PCT% |
+            "
+            else
+              COMPARISON_MESSAGE="ℹ️ *Base coverage report not found. Skipping comparison.*"
+              TABLE_BODY="
+              | Category | PR Percentage |
+              | --- | ---: |
+              | Lines | $LINES_PCT% |
+              | Statements | $STATEMENTS_PCT% |
+              | Functions | $FUNCTIONS_PCT% |
+              | Branches | $BRANCHES_PCT% |
+              "
+          fi
+
+          COMMENT_BODY="---
+          ### 📊 CI Coverage Report
+          **Status: $STATUS**
+          _$MESSAGE_
+
+          **Comparison with \`development\`:**
+          $COMPARISON_MESSAGE
+          
+          $TABLE_BODY
+          
+          ---
+          *This is a CI-generated report for **total project coverage**. Data is also being sent to Codecov.*"
+          
+          echo "$COMMENT_BODY" > comment-body.md
+          echo "message=$MESSAGE" >> $GITHUB_OUTPUT
+
+      - name: Post Coverage Comment to PR
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request' && steps.test-cov-pr.outcome == 'success'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const commentBody = fs.readFileSync('comment-body.md', 'utf8');
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(comment =>
+              comment.user.login === 'github-actions[bot]' &&
+              comment.body.includes('CI Coverage Report')
+            );
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
+
+      - name: Fail job if coverage threshold not met
+        if: steps.coverage.outputs.status == 'fail'
+        run: |
+          echo "${{ steps.coverage.outputs.message }}"
+          exit 1
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info
+          flags: unittests
+          name: ${{ inputs.service-name }}
+          fail_ci_if_error: true
+          verbose: true
+          override_branch: ${{ github.head_ref || github.ref_name }}
+          override_commit: ${{ github.event.pull_request.head.sha || github.sha }}
