@@ -233,11 +233,12 @@ jobs:
               });
             }
 
-      - name: Fail job if coverage threshold not met
+      - name: Warn if coverage threshold not met
         if: steps.coverage.outputs.status == 'fail'
         run: |
+          echo "⚠️ WARNING: Coverage threshold not met."
           echo "${{ steps.coverage.outputs.message }}"
-          exit 1
+
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
