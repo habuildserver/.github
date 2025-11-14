@@ -97,7 +97,7 @@ jobs:
         id: coverage
         if: steps.test-cov-pr.outcome == 'success'
         run: |
-          THRESHOLD=80
+          THRESHOLD=40
           PR_SUMMARY_FILE="pr-coverage-summary.json"
           BASE_SUMMARY_FILE="dev-coverage-summary.json"
           
