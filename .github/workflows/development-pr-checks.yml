@@ -97,7 +97,7 @@ jobs:
         id: coverage
         if: steps.test-cov-pr.outcome == 'success'
         run: |
-          THRESHOLD=40
+          THRESHOLD=80
           PR_SUMMARY_FILE="pr-coverage-summary.json"
           BASE_SUMMARY_FILE="dev-coverage-summary.json"
           
@@ -116,9 +116,9 @@ jobs:
           IS_BELOW_THRESHOLD=$(echo "$LINES_PCT < $THRESHOLD" | bc)
           
           if [ "$IS_BELOW_THRESHOLD" -eq 1 ]; then
-            STATUS="❌ FAILED"
+            STATUS="⚠️ WARNING"
             MESSAGE="Total coverage is ${LINES_PCT}%. Threshold of ${THRESHOLD}% was not met."
-            echo "status=fail" >> $GITHUB_OUTPUT
+            echo "status=warning" >> $GITHUB_OUTPUT
           else
             STATUS="✅ PASSED"
             MESSAGE="Total coverage is ${LINES_PCT}%. Threshold of ${THRESHOLD}% was met."
@@ -234,10 +234,11 @@ jobs:
             }
 
       - name: Warn if coverage threshold not met
-        if: steps.coverage.outputs.status == 'fail'
+        if: steps.coverage.outputs.status == 'warning'
         run: |
           echo "⚠️ WARNING: Coverage threshold not met."
           echo "${{ steps.coverage.outputs.message }}"
+        continue-on-error: true
 
 
       - name: Upload coverage to Codecov
