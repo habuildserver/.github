@@ -182,10 +182,17 @@ jobs:
               "
           fi
 
+          THRESHOLD_WARNING=""
+          if [ "$IS_BELOW_THRESHOLD" -eq 1 ]; then
+            THRESHOLD_WARNING="⚠️ **Please note:** The current coverage is below the ${THRESHOLD}% threshold. While this does not block the PR, it's recommended to improve test coverage before merging."
+          fi
+          
           COMMENT_BODY="---
           ### 📊 CI Coverage Report
           **Status: $STATUS**
           _$MESSAGE_
+
+          $THRESHOLD_WARNING
 
           **Comparison with \`development\`:**
           $COMPARISON_MESSAGE
