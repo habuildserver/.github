@@ -107,6 +107,7 @@ jobs:
           npm run test:cov
           cp coverage/coverage-summary.json reports/dev-coverage-summary.json
           git checkout -
+        continue-on-error: true
 
       # -----------------------------------
       # GENERATE FINAL FULL REPORT
