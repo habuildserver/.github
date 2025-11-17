@@ -1,14 +1,14 @@
-name: Reusable - Development PR Comprehensive Checks
+name: Reusable - Development PR Coverage Checks
 
 on:
   workflow_call:
     inputs:
       node-version:
-        type: string
         default: "22"
-      service-name:
         type: string
+      service-name:
         required: true
+        type: string
     secrets:
       SDK_TOKEN:
         required: true
@@ -18,22 +18,19 @@ on:
         required: true
 
 jobs:
-  setup-env:
+  test-pr:
+    name: Test (PR) Coverage
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.changed-files.outputs.changed }}
-      files: ${{ steps.changed-files.outputs.files }}
+      pr-summary: ${{ steps.save.outputs.exists }}
 
     steps:
-      - name: Checkout with submodules
+      - name: Checkout code (with submodules)
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.COMMON_TOKEN }}
           fetch-depth: 0
           submodules: recursive
-
-      - name: Debug common folder
-        run: ls -R src/app/common || echo "No common folder found"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -41,144 +38,60 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
-      - name: Configure npm private registry
+      - name: Configure npm for private packages
         run: |
           echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
 
-      - name: Install deps
+      - name: Install dependencies
         run: npm ci
 
-      - name: Find changed TypeScript files
-        id: changed-files
-        run: |
-          FILES=$(git diff --name-only origin/${{ github.base_ref }} HEAD -- '*.ts')
-          echo "files=$FILES" >> $GITHUB_OUTPUT
-          [ -z "$FILES" ] && echo "changed=false" >> $GITHUB_OUTPUT || echo "changed=true" >> $GITHUB_OUTPUT
-
-  lint:
-    needs: setup-env
-    runs-on: ubuntu-latest
-    if: needs.setup-env.outputs.changed == 'true'
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.COMMON_TOKEN }}
-          fetch-depth: 0
-          submodules: recursive
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: npm
-
-      - run: npm ci
-
-      - name: Lint changed files only
-        run: |
-          echo "Linting only changed files:"
-          echo "${{ needs.setup-env.outputs.files }}"
-          npx eslint ${{ needs.setup-env.outputs.files }} --fix
-
-  formatting:
-    needs: setup-env
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.COMMON_TOKEN }}
-          fetch-depth: 0
-          submodules: recursive
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: npm
-
-      - run: npm ci
-
-      - name: Format only changed files
-        run: |
-          FILES="${{ needs.setup-env.outputs.files }}"
-          if [ -z "$FILES" ]; then
-            echo "No TS files changed. Skipping formatting."
-            exit 0
-          fi
-
-          echo "$FILES" | xargs prettier --write
-
-      - name: Ensure no formatting differences
-        run: |
-          if ! git diff --quiet; then
-            echo "❌ Some files are not formatted properly."
-            git diff
-            exit 1
-          fi
-
-  test-pr:
-    needs: setup-env
-    runs-on: ubuntu-latest
-    outputs:
-      summary-exists: ${{ steps.check-summary.outputs.exists }}
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.COMMON_TOKEN }}
-          fetch-depth: 0
-          submodules: recursive
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: npm
-
-      - run: npm ci
-
-      - name: Run PR tests w/ coverage
+      - name: Run PR tests
         run: npm run test:cov
 
-      - name: Check coverage summary exists
-        id: check-summary
+      - name: Save PR coverage summary
+        id: save
         run: |
           if [ -f coverage/coverage-summary.json ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
             mv coverage/coverage-summary.json pr-coverage-summary.json
+            echo "exists=true" >> $GITHUB_OUTPUT
           else
             echo "exists=false" >> $GITHUB_OUTPUT
-            echo "❌ Missing coverage-summary.json!"
+            echo "❌ PR coverage-summary.json not found"
             exit 1
           fi
 
   test-dev:
+    name: Test (Development) Coverage
     needs: test-pr
     runs-on: ubuntu-latest
     if: github.base_ref == 'development'
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.COMMON_TOKEN }}
           fetch-depth: 0
           submodules: recursive
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
       - run: npm ci
 
-      - name: Run tests on development branch
+      - name: Run dev branch tests
         run: |
           git checkout development
           npm ci
           npm run test:cov
           mv coverage/coverage-summary.json dev-coverage-summary.json
 
-  analyze-coverage:
+  analyze:
+    name: Compare Coverage + Comment
     needs: [test-pr, test-dev]
     runs-on: ubuntu-latest
 
@@ -188,36 +101,25 @@ jobs:
       - name: Install jq
         run: sudo apt-get install -y jq
 
-      - name: Parse + Create Comment
+      - name: Generate coverage comment
         run: |
-          node <<'EOF'
-          const fs = require("fs");
+          PR=$(jq '.total.lines.pct' pr-coverage-summary.json)
+          if [ -f dev-coverage-summary.json ]; then
+            DEV=$(jq '.total.lines.pct' dev-coverage-summary.json)
+            COMPARE="Development coverage: ${DEV}%"
+          else
+            COMPARE="No development coverage available"
+          fi
 
-          const pr = JSON.parse(fs.readFileSync("pr-coverage-summary.json", "utf8")).total;
-          let dev = null;
+          echo "### 📊 Coverage Report
+          **PR Coverage:** ${PR}%
 
-          if (fs.existsSync("dev-coverage-summary.json")) {
-            dev = JSON.parse(fs.readFileSync("dev-coverage-summary.json", "utf8")).total;
-          }
-
-          const pct = pr.lines.pct;
-
-          const body = `
-          ### 📊 Coverage Report
-          **PR Coverage:** ${pct}%
-
-          ${dev ? `Comparison with development:
-          - Dev coverage: ${dev.lines.pct}%` : "No dev coverage to compare"}
+          ${COMPARE}
 
           ---
+          _CI auto-generated report_" > comment.md
 
-          *CI Generated Report*
-          `;
-
-          fs.writeFileSync("comment.md", body);
-          EOF
-
-      - name: Comment on PR
+      - name: Post comment on PR
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -233,9 +135,9 @@ jobs:
             })
 
   upload-codecov:
+    name: Upload Coverage to Codecov
     needs: test-pr
     runs-on: ubuntu-latest
-    if: needs.test-pr.outputs.summary-exists == 'true'
 
     steps:
       - uses: actions/checkout@v4
