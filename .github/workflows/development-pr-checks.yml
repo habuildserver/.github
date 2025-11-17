@@ -33,6 +33,9 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+      
+      - name: Debug common folder
+        run: ls -R src/app/common || echo "No common folder!"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
