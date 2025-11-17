@@ -4,12 +4,16 @@ on:
   workflow_call:
     inputs:
       node-version:
+        description: "Node.js version"
         required: false
         default: "22"
         type: string
+
       service-name:
+        description: "Service name for Codecov flag"
         required: true
         type: string
+
     secrets:
       SDK_TOKEN:
         required: true
@@ -19,20 +23,20 @@ on:
         required: true
 
 jobs:
-  # ================================
-  # PR COVERAGE JOB
-  # ================================
-  pr-tests:
-    name: PR Tests + Coverage
+  prepare:
+    name: Checkout + Install
     runs-on: ubuntu-latest
 
+    outputs:
+      cache-hit: ${{ steps.cache-node.outputs.cache-hit }}
+
     steps:
-      - name: Checkout code
+      - name: Checkout (with submodules)
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.COMMON_TOKEN }}
-          submodules: recursive
           fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.COMMON_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -40,116 +44,117 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: "npm"
 
-      - name: Configure npm
+      - name: Configure npm private registry
         run: |
           echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
 
-      # ---------------- LINT ONLY CHANGED FILES ----------------
-      - name: Get TS diff
-        id: diff
-        continue-on-error: true
-        run: |
-          FILES=$(git diff --name-only origin/${{ github.base_ref }} HEAD -- '*.ts' '*.tsx' || true)
-          echo "FILES=${FILES}"
-          echo "files=${FILES}" >> $GITHUB_OUTPUT
-          if [[ -z "$FILES" ]]; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Lint only changed files
-        if: steps.diff.outputs.changed == 'true'
-        run: |
-          echo "Linting: ${{ steps.diff.outputs.files }}"
-          npx eslint ${{ steps.diff.outputs.files }} --fix || true
-
-      - name: Full lint fallback (no diff)
-        if: steps.diff.outputs.changed == 'false'
-        run: npm run lint:check || true
-
-      # ---------------- FORMAT (skip common) ----------------
-      - name: Run Prettier (skip common)
-        run: |
-          prettier --write "src/**/*.{ts,js}" "!src/app/common/**"
-
-      - name: Fail if formatting required
-        run: |
-          if ! git diff --quiet; then
-            echo "❌ Code formatting required."
-            git diff
-            exit 1
-          fi
-
-      # ---------------- PR TESTS ----------------
       - name: Install dependencies
         run: npm ci
 
-      - name: PR Coverage
+      - name: Cache node_modules
+        id: cache-node
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-${{ inputs.node-version }}-${{ hashFiles('package-lock.json') }}
+
+
+  lint:
+    name: Lint & Prettier
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore node_modules
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-${{ inputs.node-version }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Run ESLint (full repo)
+        run: npm run lint:check
+
+      - name: Check Prettier formatting
+        run: |
+          npm run format
+          if ! git diff --quiet; then
+            echo "❌ Code not formatted. Run npm run format."
+            git diff
+            exit 1
+          fi
+          echo "✅ Formatting OK"
+
+
+  pr-tests:
+    name: PR Coverage
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore node_modules
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-${{ inputs.node-version }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Run test coverage
         run: npm run test:cov
 
-      - name: Copy PR coverage summary
+      - name: Copy PR summary
         run: cp coverage/coverage-summary.json pr-summary.json
 
-      - name: Upload PR artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: pr-coverage
           path: pr-summary.json
 
-  # ================================
-  # DEV BRANCH COVERAGE (PARALLEL)
-  # ================================
+
   dev-tests:
     name: Development Coverage
     runs-on: ubuntu-latest
-    continue-on-error: true  # DEV failures should not break CI
+    needs: prepare
+    continue-on-error: true  # allow failures
 
     steps:
-      - name: Checkout development branch
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.COMMON_TOKEN }}
-          submodules: recursive
-          fetch-depth: 0
           ref: development
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Restore node_modules
+        uses: actions/cache@v3
         with:
-          node-version: ${{ inputs.node-version }}
-          cache: "npm"
+          path: node_modules
+          key: ${{ runner.os }}-${{ inputs.node-version }}-${{ hashFiles('package-lock.json') }}
 
-      - name: Configure npm
-        run: |
-          echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
-          echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
+      - name: Run test coverage
+        run: npm run test:cov
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Dev coverage
-        run: npm run test:cov || true
-
-      - name: Copy development summary
+      - name: Copy dev summary
+        if: always()
         run: |
           if [ -f coverage/coverage-summary.json ]; then
             cp coverage/coverage-summary.json dev-summary.json
+          else
+            echo "{}" > dev-summary.json
           fi
 
-      - name: Upload dev artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: dev-coverage
           path: dev-summary.json
-        continue-on-error: true
 
-  # ================================
-  # MERGE COVERAGE + COMMENT
-  # ================================
+
   report:
-    name: Merge & Report
+    name: Coverage Report
     runs-on: ubuntu-latest
     needs: [pr-tests, dev-tests]
 
@@ -165,68 +170,84 @@ jobs:
           path: reports
         continue-on-error: true
 
-      - name: Generate Markdown Report
+      - name: Generate Markdown Table
         id: md
         run: |
-          PR=$(jq '.total.lines.pct' reports/pr-summary.json)
+          # --- PR Coverage ---
+          PR_LINES=$(jq '.total.lines.pct' reports/pr-summary.json)
+          PR_STMTS=$(jq '.total.statements.pct' reports/pr-summary.json)
+          PR_FUNCS=$(jq '.total.functions.pct' reports/pr-summary.json)
+          PR_BRANCHES=$(jq '.total.branches.pct' reports/pr-summary.json)
 
+          # --- Dev Coverage ---
           if [ -f reports/dev-summary.json ]; then
-            DEV=$(jq '.total.lines.pct' reports/dev-summary.json)
-            COMPARE="| Lines | ${PR}% | ${DEV}% |"
+            DEV_LINES=$(jq '.total.lines.pct // "N/A"' reports/dev-summary.json)
+            DEV_STMTS=$(jq '.total.statements.pct // "N/A"' reports/dev-summary.json)
+            DEV_FUNCS=$(jq '.total.functions.pct // "N/A"' reports/dev-summary.json)
+            DEV_BRANCHES=$(jq '.total.branches.pct // "N/A"' reports/dev-summary.json)
           else
-            COMPARE="| Lines | ${PR}% | N/A |"
+            DEV_LINES="N/A"
+            DEV_STMTS="N/A"
+            DEV_FUNCS="N/A"
+            DEV_BRANCHES="N/A"
           fi
 
-          echo "### 📊 Coverage Report  
-          **PR Coverage:** ${PR}%  
+          echo "
+          ### 📊 Coverage Report
 
-          | Metric | PR | Development |  
-          |-------|-----|-------------|  
-          ${COMPARE}  
+          | Metric     | PR (%)        | Development (%) |
+          |------------|---------------|------------------|
+          | Lines      | ${PR_LINES}%  | ${DEV_LINES}%    |
+          | Statements | ${PR_STMTS}%  | ${DEV_STMTS}%    |
+          | Functions  | ${PR_FUNCS}%  | ${DEV_FUNCS}%    |
+          | Branches   | ${PR_BRANCHES}% | ${DEV_BRANCHES}% |
 
-          ---  
-          _CI auto-generated report_  
+          ---
+
+          _CI auto-generated report_
           " > comment.md
 
-      - name: Post GitHub Comment
+      - name: Post PR Comment
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs = require('fs')
-            const body = fs.readFileSync('comment.md','utf8')
+            const fs = require("fs");
+            const body = fs.readFileSync("comment.md", "utf8");
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number,
-            })
+              issue_number: context.issue.number
+            });
 
-            const old = comments.find(c => c.user.login === "github-actions[bot]" && c.body.includes("Coverage Report"))
+            const existing = comments.find(c =>
+              c.user.login === "github-actions[bot]" &&
+              c.body.includes("Coverage Report")
+            );
 
-            if (old) {
+            if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                comment_id: old.id,
-                body,
-              })
+                comment_id: existing.id,
+                body
+              });
             } else {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body,
-              })
+                body
+              });
             }
 
-      # ---- Codecov Upload (Non-blocking) ----
-      - name: Upload to Codecov
+      - name: Upload to Codecov (non-blocking)
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: reports/pr-summary.json
           flags: unittests
-          name: ${{ inputs.service-name }}
+          name: ${{ inputs['service-name'] }}
           fail_ci_if_error: false
           verbose: true
