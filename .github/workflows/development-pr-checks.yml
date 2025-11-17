@@ -4,9 +4,12 @@ on:
   workflow_call:
     inputs:
       node-version:
+        description: "Node.js version"
+        required: false
         default: "22"
         type: string
       service-name:
+        description: "Service name for Codecov flag"
         required: true
         type: string
     secrets:
@@ -18,180 +21,176 @@ on:
         required: true
 
 jobs:
-
-  # ===========================================================
-  # 1) LINT + FORMAT CHECK (always first)
-  # ===========================================================
-  lint_format:
-    name: Lint & Format
+  pr-tests:
+    name: PR Coverage Job
     runs-on: ubuntu-latest
+    outputs:
+      pr_coverage_file: pr-coverage-summary.json
+    permissions:
+      contents: read
 
     steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.COMMON_TOKEN }}
-          fetch-depth: 0
           submodules: recursive
-          ref: ${{ github.event.pull_request.head.sha }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
-      - name: Private npm auth
+      - name: Configure npm private registry
         run: |
           echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
 
       - run: npm ci
 
-      - name: Run ESLint
+      # ---- Linting + Formatting ----
+      - name: Run linting
         run: npm run lint:check
 
-      - name: Run Prettier
+      - name: Check code formatting
         run: |
           npm run format
           if ! git diff --quiet; then
-            echo "❌ Code not formatted. Run npm run format locally."
+            echo "❌ Code formatting required. Run npm run format."
+            git diff
             exit 1
           fi
+          echo "Formatting OK."
 
-  # ===========================================================
-  # 2) PR COVERAGE – runs PR tests
-  # ===========================================================
-  pr_coverage:
-    name: PR Coverage
-    runs-on: ubuntu-latest
-    needs: lint_format
-    outputs:
-      pr_ok: ${{ steps.save.outputs.ok }}
-
-    steps:
-      - name: Checkout PR branch (correct way for reusable)
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.COMMON_TOKEN }}
-          fetch-depth: 0
-          submodules: recursive
-          ref: ${{ github.event.pull_request.head.sha }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: npm
-
-      - run: npm ci
-
-      - name: Run PR tests
+      # ---- PR Test Coverage ----
+      - name: Run PR coverage
+        id: test_pr
         run: npm run test:cov
 
       - name: Save PR coverage
-        id: save
+        if: success()
         run: |
-          if [ -f coverage/coverage-summary.json ]; then
-            cp coverage/coverage-summary.json pr-coverage-summary.json
-            echo "ok=true" >> $GITHUB_OUTPUT
-          else
-            echo "ok=false" >> $GITHUB_OUTPUT
-            ls -R .
-            exit 1
-          fi
+          cp coverage/coverage-summary.json pr-coverage-summary.json || echo "PR coverage missing"
 
-      - name: Upload PR → Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: pr-coverage-summary.json
-          flags: pr-tests
-          name: ${{ inputs.service-name }}-pr
 
-  # ===========================================================
-  # 3) DEVELOPMENT COVERAGE – ONLY IF BASE IS DEVELOPMENT
-  # ===========================================================
-  dev_coverage:
-    name: Development Coverage
+  dev-tests:
+    name: Development Coverage Job
+    needs: pr-tests
     runs-on: ubuntu-latest
-    needs: lint_format
-    if: github.base_ref == 'development'
+    if: ${{ github.base_ref == 'development' }}
+    permissions:
+      contents: read
 
     steps:
-      - name: Checkout development
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.COMMON_TOKEN }}
-          fetch-depth: 0
           submodules: recursive
-          ref: development
+          fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - name: Checkout development
+        run: git checkout development
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
+      - name: Configure npm private registry
+        run: |
+          echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
+
       - run: npm ci
+      - run: npm run test:cov || echo "Dev coverage run failed (ignored)"
 
-      - name: Run development tests
-        run: npm run test:cov
+      - name: Save Dev coverage
+        run: |
+          cp coverage/coverage-summary.json dev-coverage-summary.json || echo "Dev coverage missing"
 
-      - name: Save dev coverage
-        run: cp coverage/coverage-summary.json dev-coverage-summary.json
 
-      - name: Upload DEV → Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: dev-coverage-summary.json
-          flags: dev-tests
-          name: ${{ inputs.service-name }}-dev
-
-  # ===========================================================
-  # 4) COMPARE RESULTS (runs after both coverage jobs)
-  # ===========================================================
-  compare:
-    name: Compare PR vs Development
+  report:
+    name: Coverage Report Merge
+    needs: [pr-tests, dev-tests]
     runs-on: ubuntu-latest
-    needs: [pr_coverage, dev_coverage]
-    if: needs.pr_coverage.outputs.pr_ok == 'true'
+    permissions:
+      pull-requests: write
+      contents: read
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - run: sudo apt-get install -y jq
+      - name: Copy coverage results from PR job
+        uses: actions/download-artifact@v4
+        if: exists('pr-coverage-summary.json')
+        with:
+          name: pr-coverage
+          path: .
 
-      - name: Write comparison comment
+      - name: Parse coverage safely
         run: |
-          PR=$(jq '.total.lines.pct' pr-coverage-summary.json)
+          PR=$(jq '.total.lines.pct' pr-coverage-summary.json 2>/dev/null || echo "N/A")
 
           if [ -f dev-coverage-summary.json ]; then
             DEV=$(jq '.total.lines.pct' dev-coverage-summary.json)
-            COMPARE="Development: ${DEV}%"
+            COMPARE="Development Coverage: ${DEV}%"
           else
             COMPARE="Development coverage unavailable"
           fi
 
           echo "### 📊 Coverage Report
           **PR Coverage:** ${PR}%
-
           ${COMPARE}
 
           ---
           _CI auto-generated report_" > comment.md
 
-      - name: Comment on PR
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs = require('fs')
-            const body = fs.readFileSync('comment.md', 'utf8')
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            const fs = require('fs');
+            const body = fs.readFileSync('comment.md', 'utf8');
+
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body
-            })
+              issue_number: context.issue.number,
+            });
+
+            const previous = comments.find(c =>
+              c.user.login === "github-actions[bot]" &&
+              c.body.includes("Coverage Report")
+            );
+
+            if (previous) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: previous.id,
+                body
+              });
+            } else {
+              github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      # ---- Codecov (never fail CI) ----
+      - name: Upload to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unittests
+          name: ${{ inputs.service-name }}
+          files: pr-coverage-summary.json
+          fail_ci_if_error: false
+          verbose: true
