@@ -1,10 +1,25 @@
 name: Development PR Comprehensive Checks
 
 on:
-  pull_request:
-    branches: [development]
-  push:
-    branches: [development, staging, main]
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version"
+        required: false
+        default: "22"
+        type: string
+      service-name:
+        description: "Service name for Codecov flag"
+        required: true
+        type: string
+    secrets:
+      SDK_TOKEN:
+        required: true
+      CODECOV_TOKEN:
+        required: true
+      COMMON_TOKEN:
+        required: true
+
 
 jobs:
 
