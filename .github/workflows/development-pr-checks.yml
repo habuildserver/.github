@@ -12,233 +12,234 @@ on:
         description: "Service name for Codecov flag"
         required: true
         type: string
-
     secrets:
       SDK_TOKEN:
         required: true
       CODECOV_TOKEN:
         required: true
       COMMON_TOKEN:
-        required: false
+        required: true
 
 jobs:
-  # ======================================================
-  # 1️⃣ Checkout + Install + Lint + Format
-  # ======================================================
-  lint:
-    name: Lint & Format Check
+  lint-test-coverage:
+    name: ESLint, Format & Test Coverage Check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
 
     steps:
-      - name: Checkout code
+      # -------------------------
+      # CHECKOUT WITH SUBMODULE
+      # -------------------------
+      - name: Checkout code (with submodules)
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.COMMON_TOKEN || secrets.GITHUB_TOKEN }}
-          submodules: recursive
           fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.COMMON_TOKEN }}
 
+      # -------------------------
+      # NODE SETUP
+      # -------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: npm
+          cache: "npm"
 
+      # -------------------------
+      # PRIVATE NPM AUTH
+      # -------------------------
       - name: Configure npm for private packages
         run: |
           echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
 
+      # -------------------------
+      # INSTALL DEPENDENCIES
+      # -------------------------
       - name: Install dependencies
         run: npm ci
 
-      - name: Run lint (ignore common folder)
+      # -------------------------
+      # LINTING
+      # -------------------------
+      - name: Run linting
+        run: npm run lint:check
+
+      # -------------------------
+      # FORMAT CHECK
+      # -------------------------
+      - name: Check code formatting
         run: |
-          npx eslint "./src/**/*.ts" --ignore-pattern "src/app/common/**"
-      
-      - name: Run prettier check
-        run: |
-          npx prettier --write "src/**/*.{ts,js}" --ignore-path .prettierignore
+          npm run format
           if ! git diff --quiet; then
-            echo "❌ Formatting issues found"
-            git diff
+            echo "❌ Code is not properly formatted."
             exit 1
           fi
 
-
-  # ======================================================
-  # 2️⃣ Run PR coverage
-  # ======================================================
-  pr-tests:
-    name: PR Test Coverage
-    runs-on: ubuntu-latest
-    needs: lint
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: npm
-
-      - name: Install deps
-        run: npm ci
-
-      - name: Run test coverage
+      # -------------------------
+      # RUN PR TEST COVERAGE
+      # -------------------------
+      - name: Run PR tests with coverage
+        id: test-pr
         run: npm run test:cov
 
-      - name: Move PR coverage to root
+      # -----------------------------------
+      # SAVE PR COVERAGE REPORT
+      # -----------------------------------
+      - name: Store PR coverage summary
         run: |
-          cp coverage/coverage-summary.json pr-coverage-summary.json
-          cp coverage/lcov.info pr-lcov.info
+          mkdir -p reports
+          cp coverage/coverage-summary.json reports/pr-coverage-summary.json
 
-      - name: Upload PR coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-coverage
-          path: |
-            pr-coverage-summary.json
-            pr-lcov.info
-
-
-  # ======================================================
-  # 3️⃣ Run Development coverage in parallel
-  # ======================================================
-  dev-tests:
-    name: Development Branch Coverage
-    runs-on: ubuntu-latest
-    if: github.base_ref == 'development'
-    needs: lint
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fetch development branch
+      # -----------------------------------
+      # RUN DEV BRANCH TEST COVERAGE
+      # -----------------------------------
+      - name: Run development branch tests
+        id: dev-tests
+        if: github.base_ref == 'development'
         run: |
-          git fetch origin development
           git checkout development
+          npm ci
+          npm run test:cov
+          cp coverage/coverage-summary.json reports/dev-coverage-summary.json
+          git checkout -
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node-version }}
-          cache: npm
-
-      - name: Install deps
-        run: npm ci
-
-      - name: Run test coverage
-        run: npm run test:cov
-
-      - name: Move DEV coverage to root
+      # -----------------------------------
+      # GENERATE FINAL FULL REPORT
+      # (Screenshot #1 style)
+      # -----------------------------------
+      - name: Generate Full Coverage Report
+        id: coverage-report
         run: |
-          cp coverage/coverage-summary.json dev-coverage-summary.json
+          PR="reports/pr-coverage-summary.json"
+          DEV="reports/dev-coverage-summary.json"
 
-      - name: Upload DEV coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dev-coverage
-          path: dev-coverage-summary.json
-
-
-  # ======================================================
-  # 4️⃣ Final coverage report (Comparison Table)
-  # ======================================================
-  report:
-    name: Coverage Report
-    runs-on: ubuntu-latest
-    needs: [pr-tests, dev-tests]
-
-    permissions:
-      pull-requests: write
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download PR artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: pr-coverage
-          path: .
-
-      - name: Download DEV artifact (safe)
-        uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: dev-coverage
-          path: .
-
-      - name: Generate Coverage Report Markdown
-        run: |
-          PR=$(jq '.total.lines.pct' pr-coverage-summary.json 2>/dev/null || echo "N/A")
-
-          if [ -f dev-coverage-summary.json ]; then
-            DEV=$(jq '.total.lines.pct' dev-coverage-summary.json)
-          else
-            DEV="N/A"
+          if [ ! -f "$PR" ]; then
+            echo "Coverage summary not found!"
+            exit 1
           fi
 
-          echo "### 📊 Combined Coverage Report
+          # PR metrics
+          PR_LINES=$(jq '.total.lines.pct' $PR)
+          PR_STMTS=$(jq '.total.statements.pct' $PR)
+          PR_FUNCS=$(jq '.total.functions.pct' $PR)
+          PR_BRANCHES=$(jq '.total.branches.pct' $PR)
 
-          | Metric | PR Branch | Development |
-          |-------|----------:|------------:|
-          | **Lines** | ${PR}% | ${DEV}% |
+          # Threshold
+          THRESHOLD=80
+          BELOW=$(echo "$PR_LINES < $THRESHOLD" | bc)
+
+          STATUS=""
+          if [ "$BELOW" -eq 1 ]; then
+            STATUS="⚠️ WARNING"
+            THRESHOLD_MSG="⚠️ **Please note:** The current coverage is below the ${THRESHOLD}% threshold."
+          else
+            STATUS="✅ PASSED"
+            THRESHOLD_MSG=""
+          fi
+
+          # Development metrics
+          if [ -f "$DEV" ]; then
+            DEV_LINES=$(jq '.total.lines.pct' $DEV)
+            DEV_STMTS=$(jq '.total.statements.pct' $DEV)
+            DEV_FUNCS=$(jq '.total.functions.pct' $DEV)
+            DEV_BRANCHES=$(jq '.total.branches.pct' $DEV)
+
+            COMPARISON_TABLE="
+            | Category | PR Percentage | Base Branch |
+            | --- | ---: | ---: |
+            | Lines | ${PR_LINES}% | ${DEV_LINES}% |
+            | Statements | ${PR_STMTS}% | ${DEV_STMTS}% |
+            | Functions | ${PR_FUNCS}% | ${DEV_FUNCS}% |
+            | Branches | ${PR_BRANCHES}% | ${DEV_BRANCHES}% |
+            "
+
+            COMP_MSG="Comparison with \`development\`:"
+            COMP_SUB="✔️ Coverage met or exceeded base branch on all metrics."
+
+          else
+            COMPARISON_TABLE="
+            | Category | PR Percentage |
+            | --- | ---: |
+            | Lines | ${PR_LINES}% |
+            | Statements | ${PR_STMTS}% |
+            | Functions | ${PR_FUNCS}% |
+            | Branches | ${PR_BRANCHES}% |
+            "
+
+            COMP_MSG="ℹ️ Development coverage not available"
+            COMP_SUB=""
+          fi
+
+          # Final message
+          echo "---
+          ### 📊 CI Coverage Report
+
+          **Status:** ${STATUS}
+
+          ${THRESHOLD_MSG}
+
+          ${COMP_MSG}  
+          ${COMP_SUB}
+
+          ${COMPARISON_TABLE}
 
           ---
 
-          _Auto-generated CI report_
-          " > comment.md
+          *This is a CI-generated report for total project coverage. Data is also being sent to Codecov.*" > coverage-comment.md
 
-
-      - name: Post PR comment
-        if: github.event_name == 'pull_request'
+      # -----------------------------------
+      # POST COMMENT TO PR (AUTO-UPDATE)
+      # -----------------------------------
+      - name: Post Coverage Comment to PR
         uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('comment.md', 'utf8');
+            const body = fs.readFileSync('coverage-comment.md', 'utf8');
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number
+              issue_number: context.issue.number,
             });
 
-            const existing = comments.find(c =>
-              c.user.login === "github-actions[bot]" &&
-              c.body.includes("Combined Coverage Report")
+            const existing = comments.find(
+              c => c.user.login === 'github-actions[bot]' &&
+                   c.body.includes('CI Coverage Report')
             );
 
             if (existing) {
-              github.rest.issues.updateComment({
+              await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 comment_id: existing.id,
-                body
+                body,
               });
             } else {
-              github.rest.issues.createComment({
+              await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body
+                body,
               });
             }
 
-      - name: Upload PR coverage to Codecov (non-blocking)
-        continue-on-error: true
+      # -----------------------------------
+      # CODECOV UPLOAD (NON BLOCKING)
+      # -----------------------------------
+      - name: Upload to Codecov (does not fail CI)
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: pr-lcov.info
+          files: coverage/lcov.info
           flags: unittests
-          fail_ci_if_error: false
-          verbose: true
           name: ${{ inputs.service-name }}
+          verbose: true
+        continue-on-error: true
