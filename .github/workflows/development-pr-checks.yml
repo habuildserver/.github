@@ -1,28 +1,18 @@
-name: Reusable - Development PR Comprehensive Checks
+name: Development PR Comprehensive Checks
 
 on:
-  workflow_call:
-    inputs:
-      node-version:
-        description: "Node.js version"
-        required: false
-        default: "22"
-        type: string
-      service-name:
-        description: "Service name for Codecov flag"
-        required: true
-        type: string
-    secrets:
-      SDK_TOKEN:
-        required: true
-      CODECOV_TOKEN:
-        required: true
-      COMMON_TOKEN:
-        required: true
+  pull_request:
+    branches: [development]
+  push:
+    branches: [development, staging, main]
 
 jobs:
-  lint-test-coverage:
-    name: ESLint, Format & Test Coverage Check
+
+  #############################################
+  # JOB A — PR Lint + Tests (with coverage)
+  #############################################
+  pr-tests:
+    name: PR Lint + Tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,217 +20,206 @@ jobs:
       id-token: write
 
     steps:
-      # -------------------------
-      # CHECKOUT WITH SUBMODULE
-      # -------------------------
       - name: Checkout code (with submodules)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          submodules: recursive
           token: ${{ secrets.COMMON_TOKEN }}
+          submodules: recursive
+          fetch-depth: 0
 
-      # -------------------------
-      # NODE SETUP
-      # -------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ inputs.node-version }}
-          cache: "npm"
+          node-version: 22
+          cache: npm
 
-      # -------------------------
-      # PRIVATE NPM AUTH
-      # -------------------------
       - name: Configure npm for private packages
         run: |
           echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
 
-      # -------------------------
-      # INSTALL DEPENDENCIES
-      # -------------------------
       - name: Install dependencies
         run: npm ci
 
-      # -------------------------
-      # LINTING
-      # -------------------------
+      # LINT
       - name: Run linting
         run: npm run lint:check
 
-      # -------------------------
-      # FORMAT CHECK
-      # -------------------------
-      - name: Check code formatting
+      # FORMAT
+      - name: Check formatting
         run: |
           npm run format
-          if ! git diff --quiet; then
-            echo "❌ Code is not properly formatted."
-            exit 1
-          fi
+          git diff --quiet || (echo "❌ Formatting issues found"; exit 1)
 
-      # -------------------------
-      # RUN PR TEST COVERAGE
-      # -------------------------
+      # COVERAGE
       - name: Run PR tests with coverage
-        id: test-pr
         run: npm run test:cov
 
-      # -----------------------------------
-      # SAVE PR COVERAGE REPORT
-      # -----------------------------------
-      - name: Store PR coverage summary
+      # SAVE COVERAGE
+      - name: Save PR coverage
         run: |
           mkdir -p reports
-          cp coverage/coverage-summary.json reports/pr-coverage-summary.json
+          cp coverage/coverage-summary.json reports/pr.json
 
-      # -----------------------------------
-      # RUN DEV BRANCH TEST COVERAGE
-      # -----------------------------------
-      - name: Run development branch tests
-        id: dev-tests
-        if: github.base_ref == 'development'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-coverage
+          path: reports/pr.json
+
+
+  #############################################
+  # JOB B — Development Coverage (Fully Non-blocking)
+  #############################################
+  dev-tests:
+    name: Development Coverage (non-blocking)
+    runs-on: ubuntu-latest
+    if: github.base_ref == 'development'
+    continue-on-error: true   # <-- entire job never fails
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        continue-on-error: true   # ignore checkout failures
+
+      - name: Switch to development branch
+        run: git checkout development
+        continue-on-error: true   # ignore branch switch failures
+
+      - name: Install deps
+        run: npm ci
+        continue-on-error: true   # ignore installation failures
+
+      - name: Run dev tests with coverage
+        run: npm run test:cov
+        continue-on-error: true   # ignore test failures
+
+      - name: Save dev coverage if exists
         run: |
-          git checkout development
-          npm ci
-          npm run test:cov
-          cp coverage/coverage-summary.json reports/dev-coverage-summary.json
-          git checkout -
+          mkdir -p reports
+          if [ -f coverage/coverage-summary.json ]; then
+            cp coverage/coverage-summary.json reports/dev.json
+            echo "Dev coverage found"
+          else
+            echo "No dev coverage found"
+          fi
         continue-on-error: true
 
-      # -----------------------------------
-      # GENERATE FINAL FULL REPORT
-      # (Screenshot #1 style)
-      # -----------------------------------
-      - name: Generate Full Coverage Report
-        id: coverage-report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dev-coverage
+          path: reports/dev.json
+          if-no-files-found: ignore
+        continue-on-error: true
+
+
+  #############################################
+  # JOB C — Coverage Report (Final combined comment)
+  #############################################
+  coverage-report:
+    name: Combine PR + Development Coverage
+    runs-on: ubuntu-latest
+    needs:
+      - pr-tests
+      - dev-tests
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-coverage
+          path: reports
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dev-coverage
+          path: reports
+          continue-on-error: true
+
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      - name: Generate combined report
         run: |
-          PR="reports/pr-coverage-summary.json"
-          DEV="reports/dev-coverage-summary.json"
+          PR=reports/pr.json
+          DEV=reports/dev.json
 
-          if [ ! -f "$PR" ]; then
-            echo "Coverage summary not found!"
-            exit 1
-          fi
-
-          # PR metrics
           PR_LINES=$(jq '.total.lines.pct' $PR)
-          PR_STMTS=$(jq '.total.statements.pct' $PR)
+          PR_STATEMENTS=$(jq '.total.statements.pct' $PR)
           PR_FUNCS=$(jq '.total.functions.pct' $PR)
           PR_BRANCHES=$(jq '.total.branches.pct' $PR)
 
-          # Threshold
-          THRESHOLD=80
-          BELOW=$(echo "$PR_LINES < $THRESHOLD" | bc)
-
-          STATUS=""
-          if [ "$BELOW" -eq 1 ]; then
-            STATUS="⚠️ WARNING"
-            THRESHOLD_MSG="⚠️ **Please note:** The current coverage is below the ${THRESHOLD}% threshold."
-          else
-            STATUS="✅ PASSED"
-            THRESHOLD_MSG=""
-          fi
-
-          # Development metrics
           if [ -f "$DEV" ]; then
             DEV_LINES=$(jq '.total.lines.pct' $DEV)
-            DEV_STMTS=$(jq '.total.statements.pct' $DEV)
+            DEV_STATEMENTS=$(jq '.total.statements.pct' $DEV)
             DEV_FUNCS=$(jq '.total.functions.pct' $DEV)
             DEV_BRANCHES=$(jq '.total.branches.pct' $DEV)
 
-            COMPARISON_TABLE="
-            | Category | PR Percentage | Base Branch |
+            TABLE="| Category | PR Branch | Development |
             | --- | ---: | ---: |
             | Lines | ${PR_LINES}% | ${DEV_LINES}% |
-            | Statements | ${PR_STMTS}% | ${DEV_STMTS}% |
+            | Statements | ${PR_STATEMENTS}% | ${DEV_STATEMENTS}% |
             | Functions | ${PR_FUNCS}% | ${DEV_FUNCS}% |
-            | Branches | ${PR_BRANCHES}% | ${DEV_BRANCHES}% |
-            "
+            | Branches | ${PR_BRANCHES}% | ${DEV_BRANCHES}% |"
 
-            COMP_MSG="Comparison with \`development\`:"
-            COMP_SUB="✔️ Coverage met or exceeded base branch on all metrics."
-
-          else
-            COMPARISON_TABLE="
-            | Category | PR Percentage |
+                      else
+                        TABLE="| Category | PR Branch |
             | --- | ---: |
             | Lines | ${PR_LINES}% |
-            | Statements | ${PR_STMTS}% |
+            | Statements | ${PR_STATEMENTS}% |
             | Functions | ${PR_FUNCS}% |
             | Branches | ${PR_BRANCHES}% |
-            "
 
-            COMP_MSG="ℹ️ Development coverage not available"
-            COMP_SUB=""
-          fi
+            ℹ️ Dev coverage unavailable"
+                      fi
 
-          # Final message
-          echo "---
-          ### 📊 CI Coverage Report
+                      echo "### 📊 Combined Coverage Report
 
-          **Status:** ${STATUS}
+            ${TABLE}
 
-          ${THRESHOLD_MSG}
+            _Auto-generated CI report_" > coverage-comment.md
 
-          ${COMP_MSG}  
-          ${COMP_SUB}
-
-          ${COMPARISON_TABLE}
-
-          ---
-
-          *This is a CI-generated report for total project coverage. Data is also being sent to Codecov.*" > coverage-comment.md
-
-      # -----------------------------------
-      # POST COMMENT TO PR (AUTO-UPDATE)
-      # -----------------------------------
-      - name: Post Coverage Comment to PR
+      - name: Post PR Comment
         uses: actions/github-script@v6
-        if: github.event_name == 'pull_request'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const body = fs.readFileSync('coverage-comment.md', 'utf8');
+            const body = fs.readFileSync('coverage-comment.md','utf8');
 
-            const { data: comments } = await github.rest.issues.listComments({
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-            });
+              body
+            })
 
-            const existing = comments.find(
-              c => c.user.login === 'github-actions[bot]' &&
-                   c.body.includes('CI Coverage Report')
-            );
 
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
+  #############################################
+  # JOB D — Codecov Upload (Optional / Non-blocking)
+  #############################################
+  codecov:
+    name: Codecov Upload
+    runs-on: ubuntu-latest
+    needs: pr-tests
+    continue-on-error: true
 
-      # -----------------------------------
-      # CODECOV UPLOAD (NON BLOCKING)
-      # -----------------------------------
-      - name: Upload to Codecov (does not fail CI)
-        uses: codecov/codecov-action@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-coverage
+          path: reports
+
+      - uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage/lcov.info
+          files: reports/pr.json
           flags: unittests
-          name: ${{ inputs.service-name }}
+          fail_ci_if_error: false
           verbose: true
-        continue-on-error: true
