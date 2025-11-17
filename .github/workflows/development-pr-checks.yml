@@ -31,8 +31,9 @@ jobs:
       - name: Checkout code (with submodules)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          token: ${{ secrets.COMMON_TOKEN }}
           submodules: recursive
+          fetch-depth: 0
       
       - name: Debug common folder
         run: ls -R src/app/common || echo "No common folder!"
