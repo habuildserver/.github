@@ -69,7 +69,7 @@ jobs:
           else
             echo "Linting changed files:"
             echo "$CHANGED_FILES"
-            echo "$CHANGED_FILES" | xargs npm run lint:check --
+            npx eslint $CHANGED_FILES
           fi
         continue-on-error: false
 
@@ -81,7 +81,7 @@ jobs:
           else
             echo "Checking formatting on changed files:"
             echo "$CHANGED_FILES"
-            echo "$CHANGED_FILES" | xargs npm run format --
+            npx prettier --write $CHANGED_FILES
             if ! git diff --quiet; then
               echo "❌ Code is not properly formatted. Run 'npm run format' locally."
               git diff
