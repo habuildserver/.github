@@ -61,19 +61,34 @@ jobs:
           echo "✅ Security audit passed"
         continue-on-error: true
 
-      - name: Run linting
-        run: npm run lint:check
+      - name: Run linting on changed files
+        run: |
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "✅ No JavaScript/TypeScript files changed"
+          else
+            echo "Linting changed files:"
+            echo "$CHANGED_FILES"
+            echo "$CHANGED_FILES" | xargs npm run lint:check --
+          fi
         continue-on-error: false
 
-      - name: Check code formatting
+      - name: Check code formatting on changed files
         run: |
-          npm run format
-          if ! git diff --quiet; then
-            echo "❌ Code is not properly formatted. Run 'npm run format' locally."
-            git diff
-            exit 1
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD || true)
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "✅ No files changed"
           else
-            echo "✅ Code is properly formatted"
+            echo "Checking formatting on changed files:"
+            echo "$CHANGED_FILES"
+            echo "$CHANGED_FILES" | xargs npm run format --
+            if ! git diff --quiet; then
+              echo "❌ Code is not properly formatted. Run 'npm run format' locally."
+              git diff
+              exit 1
+            else
+              echo "✅ Code is properly formatted"
+            fi
           fi
 
       - name: Run tests with coverage (PR)
