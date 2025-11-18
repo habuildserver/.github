@@ -75,9 +75,9 @@ jobs:
 
       - name: Check code formatting on changed files
         run: |
-          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD || true)
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx|json|yml|yaml|md)$' || true)
           if [ -z "$CHANGED_FILES" ]; then
-            echo "✅ No files changed"
+            echo "✅ No formattable files changed"
           else
             echo "Checking formatting on changed files:"
             echo "$CHANGED_FILES"
