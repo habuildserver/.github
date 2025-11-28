@@ -12,6 +12,13 @@ on:
         description: "Service name for Codecov flag"
         required: true
         type: string
+      
+      working-directory:
+        description: "Folder of the service"
+        required: false
+        default: "."
+        type: string
+
     secrets:
       SDK_TOKEN:
         required: true
@@ -24,6 +31,11 @@ jobs:
   lint-test-coverage:
     name: ESLint, Format & Test Coverage Check
     runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
     permissions:
       contents: read
       pull-requests: write
