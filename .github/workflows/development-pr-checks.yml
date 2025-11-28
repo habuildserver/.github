@@ -248,7 +248,7 @@ jobs:
           ---
           *This is a CI-generated report for **total project coverage**. Data is also being sent to Codecov.*"
           
-          echo "$COMMENT_BODY" > comment-body.md
+          echo "$COMMENT_BODY" > ${{ github.workspace }}/comment-body.md
           echo "message=$MESSAGE" >> $GITHUB_OUTPUT
 
       - name: Post Coverage Comment to PR
@@ -258,8 +258,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const commentBody = fs.readFileSync('comment-body.md', 'utf8');
-            
+            const path = `${process.env.GITHUB_WORKSPACE}/comment-body.md`;
+            const commentBody = fs.readFileSync(path, 'utf8');
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
