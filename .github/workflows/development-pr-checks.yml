@@ -56,7 +56,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: "npm"
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
 
       - name: Configure npm for private packages
         run: |
