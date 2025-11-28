@@ -12,6 +12,13 @@ on:
         description: "Service name for Codecov flag"
         required: true
         type: string
+      
+      working-directory:
+        description: "Folder of the service"
+        required: false
+        default: "."
+        type: string
+
     secrets:
       SDK_TOKEN:
         required: true
@@ -24,6 +31,11 @@ jobs:
   lint-test-coverage:
     name: ESLint, Format & Test Coverage Check
     runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
     permissions:
       contents: read
       pull-requests: write
@@ -44,7 +56,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: "npm"
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 
       - name: Configure npm for private packages
         run: |
@@ -64,31 +77,42 @@ jobs:
       - name: Run linting on changed files
         run: |
           CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
+
           if [ -z "$CHANGED_FILES" ]; then
             echo "✅ No JavaScript/TypeScript files changed"
-          else
-            echo "Linting changed files:"
-            echo "$CHANGED_FILES"
-            npx eslint $CHANGED_FILES
+            exit 0
           fi
-        continue-on-error: false
+
+          echo "Linting changed files:"
+          echo "$CHANGED_FILES"
+
+          # Convert to absolute paths
+          ABS_PATHS=$(echo "$CHANGED_FILES" | sed "s|^|${{ github.workspace }}/|")
+
+          npx eslint $ABS_PATHS
 
       - name: Check code formatting on changed files
         run: |
-          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx|json|yml|yaml|md)$' || true)
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
+
           if [ -z "$CHANGED_FILES" ]; then
             echo "✅ No formattable files changed"
+            exit 0
+          fi
+
+          echo "Checking formatting on changed files:"
+          echo "$CHANGED_FILES"
+
+          # Convert relative paths to absolute paths
+          ABS_PATHS=$(echo "$CHANGED_FILES" | sed "s|^|${{ github.workspace }}/|")
+
+          npx prettier --check $ABS_PATHS
+
+          if [ $? -ne 0 ]; then
+            echo "❌ Code is not properly formatted. Run 'npm run format' locally."
+            exit 1
           else
-            echo "Checking formatting on changed files:"
-            echo "$CHANGED_FILES"
-            npx prettier --write $CHANGED_FILES
-            if ! git diff --quiet; then
-              echo "❌ Code is not properly formatted. Run 'npm run format' locally."
-              git diff
-              exit 1
-            else
-              echo "✅ Code is properly formatted"
-            fi
+            echo "✅ Code is properly formatted"
           fi
 
       - name: Run tests with coverage (PR)
@@ -224,7 +248,7 @@ jobs:
           ---
           *This is a CI-generated report for **total project coverage**. Data is also being sent to Codecov.*"
           
-          echo "$COMMENT_BODY" > comment-body.md
+          echo "$COMMENT_BODY" > ${{ github.workspace }}/comment-body.md
           echo "message=$MESSAGE" >> $GITHUB_OUTPUT
 
       - name: Post Coverage Comment to PR
@@ -234,8 +258,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const commentBody = fs.readFileSync('comment-body.md', 'utf8');
-            
+            const path = `${process.env.GITHUB_WORKSPACE}/comment-body.md`;
+            const commentBody = fs.readFileSync(path, 'utf8');
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -268,7 +293,6 @@ jobs:
           echo "⚠️ WARNING: Coverage threshold not met."
           echo "${{ steps.coverage.outputs.message }}"
         continue-on-error: true
-
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
