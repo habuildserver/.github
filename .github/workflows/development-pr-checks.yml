@@ -234,7 +234,7 @@ jobs:
           fi
           
           COMMENT_BODY="---
-          ### 📊 CI Coverage Report
+          ### 📊 CI Coverage Report - **${{ inputs.service-name }}**
           **Status: $STATUS**
           _$MESSAGE_
 
@@ -242,11 +242,11 @@ jobs:
 
           **Comparison with \`development\`:**
           $COMPARISON_MESSAGE
-          
+
           $TABLE_BODY
-          
+
           ---
-          *This is a CI-generated report for **total project coverage**. Data is also being sent to Codecov.*"
+          *This is a CI-generated report for **${{ inputs.service-name }}** coverage. Data is also being sent to Codecov.*"
           
           echo "$COMMENT_BODY" > ${{ github.workspace }}/comment-body.md
           echo "message=$MESSAGE" >> $GITHUB_OUTPUT
@@ -260,6 +260,7 @@ jobs:
             const fs = require('fs');
             const path = `${process.env.GITHUB_WORKSPACE}/comment-body.md`;
             const commentBody = fs.readFileSync(path, 'utf8');
+            const serviceName = '${{ inputs.service-name }}';
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -268,9 +269,10 @@ jobs:
             });
             const botComment = comments.find(comment =>
               comment.user.login === 'github-actions[bot]' &&
-              comment.body.includes('CI Coverage Report')
+              comment.body.includes('CI Coverage Report') &&
+              comment.body.includes(`**${serviceName}**`)
             );
-            
+
             if (botComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
