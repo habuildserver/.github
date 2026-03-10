@@ -30,6 +30,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ inputs.pr_head_ref }}
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -44,6 +45,7 @@ jobs:
           GIT_COMMITTER_EMAIL: "github-actions[bot]@users.noreply.github.com"
           GIT_AUTHOR_NAME: "github-actions[bot]"
           GIT_AUTHOR_EMAIL: "github-actions[bot]@users.noreply.github.com"
+          PR_HEAD_REF: ${{ inputs.pr_head_ref }}
         run: |
           # Unset GitHub Actions env vars that interfere with semantic-release
           unset GITHUB_REF
@@ -51,8 +53,8 @@ jobs:
           unset GITHUB_HEAD_REF
           unset GITHUB_BASE_REF
 
-          export GITHUB_REF="refs/heads/${{ inputs.pr_head_ref }}"
-          export GITHUB_REF_NAME="${{ inputs.pr_head_ref }}"
+          export GITHUB_REF="refs/heads/${PR_HEAD_REF}"
+          export GITHUB_REF_NAME="${PR_HEAD_REF}"
 
           OUTPUT=$(npx --package semantic-release@${{ env.SEMANTIC_RELEASE_VERSION }} \
             --package @semantic-release/changelog@6.0.0 \
@@ -61,7 +63,7 @@ jobs:
             semantic-release \
             --dry-run \
             --no-ci \
-            --branches ${{ inputs.pr_head_ref }} 2>&1 || true)
+            --branches "${PR_HEAD_REF}" 2>&1 || true)
 
           NEW_VERSION=$(echo "$OUTPUT" | grep -Eio "the next release version is [0-9]+\.[0-9]+\.[0-9]+" | grep -Eo "[0-9]+\.[0-9]+\.[0-9]+" || echo "")
 
@@ -74,9 +76,9 @@ jobs:
 
       - name: Calculate alpha number
         id: alpha
+        env:
+          BASE_VERSION: ${{ steps.next-version.outputs.version }}
         run: |
-          BASE_VERSION="${{ steps.next-version.outputs.version }}"
-
           # Find existing alpha tags for this version
           EXISTING=$(git tag -l "v${BASE_VERSION}-alpha.*" | sort -V | tail -1 || echo "")
 
@@ -102,19 +104,26 @@ jobs:
           echo "component=$COMPONENT_NAME" >> $GITHUB_OUTPUT
 
       - name: Create tag
+        env:
+          ALPHA_TAG: ${{ steps.alpha.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git tag ${{ steps.alpha.outputs.tag }}
-          git push origin ${{ steps.alpha.outputs.tag }}
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git tag "$ALPHA_TAG"
+          git push origin "$ALPHA_TAG"
 
       - name: Create GitHub pre-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALPHA_TAG: ${{ steps.alpha.outputs.tag }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_HEAD_REF: ${{ inputs.pr_head_ref }}
         run: |
-          gh release create ${{ steps.alpha.outputs.tag }} \
-            --title "${{ steps.alpha.outputs.tag }}" \
-            --notes "Alpha pre-release from PR #${{ inputs.pr_number }} (branch: \`${{ inputs.pr_head_ref }}\`)" \
+          gh release create "$ALPHA_TAG" \
+            --title "$ALPHA_TAG" \
+            --notes "Alpha pre-release from PR #${PR_NUMBER} (branch: \`${PR_HEAD_REF}\`)" \
             --prerelease \
-            --target ${{ inputs.pr_head_ref }}
+            --target "$PR_HEAD_REF"
 
       - name: Comment on PR
         uses: mshick/add-pr-comment@v2
