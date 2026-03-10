@@ -1,0 +1,153 @@
+name: Alpha Release
+
+on:
+  workflow_call:
+    inputs:
+      pr_head_ref:
+        description: 'PR branch name'
+        required: true
+        type: string
+      pr_number:
+        description: 'PR number for comment'
+        required: true
+        type: number
+
+env:
+  SEMANTIC_RELEASE_VERSION: '24.2.0'
+  NODE_VERSION: '20.11.0'
+
+jobs:
+  alpha-release:
+    name: Create Alpha Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.pr_head_ref }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Determine next stable version
+        id: next-version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_COMMITTER_NAME: "github-actions[bot]"
+          GIT_COMMITTER_EMAIL: "github-actions[bot]@users.noreply.github.com"
+          GIT_AUTHOR_NAME: "github-actions[bot]"
+          GIT_AUTHOR_EMAIL: "github-actions[bot]@users.noreply.github.com"
+          PR_HEAD_REF: ${{ inputs.pr_head_ref }}
+        run: |
+          # Unset GitHub Actions env vars that interfere with semantic-release
+          unset GITHUB_REF
+          unset GITHUB_REF_NAME
+          unset GITHUB_HEAD_REF
+          unset GITHUB_BASE_REF
+
+          export GITHUB_REF="refs/heads/${PR_HEAD_REF}"
+          export GITHUB_REF_NAME="${PR_HEAD_REF}"
+
+          OUTPUT=$(npx --package semantic-release@${{ env.SEMANTIC_RELEASE_VERSION }} \
+            --package @semantic-release/changelog@6.0.0 \
+            --package @semantic-release/git@10.0.0 \
+            --package conventional-changelog-conventionalcommits@8.0.0 \
+            semantic-release \
+            --dry-run \
+            --no-ci \
+            --branches "${PR_HEAD_REF}" 2>&1 || true)
+
+          NEW_VERSION=$(echo "$OUTPUT" | grep -Eio "the next release version is [0-9]+\.[0-9]+\.[0-9]+" | grep -Eo "[0-9]+\.[0-9]+\.[0-9]+" || echo "")
+
+          if [ -z "$NEW_VERSION" ]; then
+            echo "::error::Could not determine next version. Ensure the PR has conventional commits (feat:, fix:, etc.)"
+            exit 1
+          fi
+
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Calculate alpha number
+        id: alpha
+        env:
+          BASE_VERSION: ${{ steps.next-version.outputs.version }}
+        run: |
+          # Find existing alpha tags for this version
+          EXISTING=$(git tag -l "v${BASE_VERSION}-alpha.*" | sort -V | tail -1 || echo "")
+
+          if [ -z "$EXISTING" ]; then
+            ALPHA_NUM=1
+          else
+            # Extract the alpha number and increment
+            ALPHA_NUM=$(echo "$EXISTING" | grep -Eo 'alpha\.[0-9]+' | grep -Eo '[0-9]+')
+            ALPHA_NUM=$((ALPHA_NUM + 1))
+          fi
+
+          ALPHA_TAG="v${BASE_VERSION}-alpha.${ALPHA_NUM}"
+          echo "tag=$ALPHA_TAG" >> $GITHUB_OUTPUT
+          echo "num=$ALPHA_NUM" >> $GITHUB_OUTPUT
+
+      - name: Get repo and component name for vendor snippet
+        id: repo
+        run: |
+          REPO_NAME=$(basename "$(git remote get-url origin)" .git)
+          # Component name strips the aws- prefix (e.g., aws-ipam -> ipam)
+          COMPONENT_NAME=$(echo "$REPO_NAME" | sed 's/^aws-//')
+          echo "name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "component=$COMPONENT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Create tag
+        env:
+          ALPHA_TAG: ${{ steps.alpha.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git tag "$ALPHA_TAG"
+          git push origin "$ALPHA_TAG"
+
+      - name: Create GitHub pre-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALPHA_TAG: ${{ steps.alpha.outputs.tag }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          PR_HEAD_REF: ${{ inputs.pr_head_ref }}
+        run: |
+          gh release create "$ALPHA_TAG" \
+            --title "$ALPHA_TAG" \
+            --notes "Alpha pre-release from PR #${PR_NUMBER} (branch: \`${PR_HEAD_REF}\`)" \
+            --prerelease \
+            --target "$PR_HEAD_REF"
+
+      - name: Comment on PR
+        uses: mshick/add-pr-comment@v2
+        with:
+          issue: ${{ inputs.pr_number }}
+          message-id: alpha-release-${{ steps.alpha.outputs.tag }}
+          message: |
+            ## Alpha Release `${{ steps.alpha.outputs.tag }}`
+
+            **Branch:** `${{ inputs.pr_head_ref }}`
+            **Based on next stable:** `v${{ steps.next-version.outputs.version }}`
+
+            ### Test in infra-stacks
+
+            Update `vendor.yaml` or catalog source version:
+            ```yaml
+            version: "${{ steps.alpha.outputs.tag }}"
+            ```
+
+            Then run:
+            ```bash
+            atmos vendor pull -c ${{ steps.repo.outputs.component }}
+            atmos terraform plan ${{ steps.repo.outputs.component }} -s <stage>
+            ```
+
+            ---
+            *Comment `/alpha-release` again to create the next alpha*
