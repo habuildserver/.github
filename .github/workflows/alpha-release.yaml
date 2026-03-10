@@ -87,6 +87,10 @@ jobs:
           else
             # Extract the alpha number and increment
             ALPHA_NUM=$(echo "$EXISTING" | grep -Eo 'alpha\.[0-9]+' | grep -Eo '[0-9]+')
+            if [ -z "$ALPHA_NUM" ] || ! [[ "$ALPHA_NUM" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not parse alpha number from tag: $EXISTING"
+              exit 1
+            fi
             ALPHA_NUM=$((ALPHA_NUM + 1))
           fi
 
@@ -110,7 +114,10 @@ jobs:
         run: |
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           git tag "$ALPHA_TAG"
-          git push origin "$ALPHA_TAG"
+          git push origin "$ALPHA_TAG" || {
+            echo "::error::Failed to push tag $ALPHA_TAG"
+            exit 1
+          }
 
       - name: Create GitHub pre-release
         env:
@@ -123,7 +130,10 @@ jobs:
             --title "$ALPHA_TAG" \
             --notes "Alpha pre-release from PR #${PR_NUMBER} (branch: \`${PR_HEAD_REF}\`)" \
             --prerelease \
-            --target "$PR_HEAD_REF"
+            --target "$PR_HEAD_REF" || {
+            echo "::error::Failed to create GitHub release for $ALPHA_TAG"
+            exit 1
+          }
 
       - name: Comment on PR
         uses: mshick/add-pr-comment@v2
