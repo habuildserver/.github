@@ -14,7 +14,7 @@ on:
 
 env:
   SEMANTIC_RELEASE_VERSION: '24.2.0'
-  NODE_VERSION: '20.11.0'
+  NODE_VERSION: '22'
 
 jobs:
   alpha-release:
@@ -23,17 +23,44 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      checks: read
 
     steps:
+      - name: Verify CI checks passed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
+
+          # Get all check runs, excluding this workflow's own jobs
+          CHECKS_JSON=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" --paginate --jq '.check_runs[]')
+
+          TOTAL=$(echo "$CHECKS_JSON" | jq -s '[.[] | select(.name != "get-pr-info" and .name != "Create Alpha Release")] | length')
+          FAILED=$(echo "$CHECKS_JSON" | jq -s '[.[] | select(.name != "get-pr-info" and .name != "Create Alpha Release") | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length')
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::error::No CI checks found on commit ${HEAD_SHA}. Push to the PR branch first to trigger CI."
+            exit 1
+          fi
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::CI checks have not all passed. Fix failing checks before creating an alpha release."
+            echo "$CHECKS_JSON" | jq -rs '.[] | select(.name != "get-pr-info" and .name != "Create Alpha Release") | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | "  \(.name): \(.conclusion // "in_progress")"'
+            exit 1
+          fi
+
+          echo "All CI checks passed on ${HEAD_SHA}"
+
       - name: Checkout PR branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: ${{ inputs.pr_head_ref }}
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -87,6 +114,10 @@ jobs:
           else
             # Extract the alpha number and increment
             ALPHA_NUM=$(echo "$EXISTING" | grep -Eo 'alpha\.[0-9]+' | grep -Eo '[0-9]+')
+            if [ -z "$ALPHA_NUM" ] || ! [[ "$ALPHA_NUM" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not parse alpha number from tag: $EXISTING"
+              exit 1
+            fi
             ALPHA_NUM=$((ALPHA_NUM + 1))
           fi
 
@@ -110,7 +141,10 @@ jobs:
         run: |
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           git tag "$ALPHA_TAG"
-          git push origin "$ALPHA_TAG"
+          git push origin "$ALPHA_TAG" || {
+            echo "::error::Failed to push tag $ALPHA_TAG"
+            exit 1
+          }
 
       - name: Create GitHub pre-release
         env:
@@ -123,10 +157,13 @@ jobs:
             --title "$ALPHA_TAG" \
             --notes "Alpha pre-release from PR #${PR_NUMBER} (branch: \`${PR_HEAD_REF}\`)" \
             --prerelease \
-            --target "$PR_HEAD_REF"
+            --target "$PR_HEAD_REF" || {
+            echo "::error::Failed to create GitHub release for $ALPHA_TAG"
+            exit 1
+          }
 
       - name: Comment on PR
-        uses: mshick/add-pr-comment@v2
+        uses: mshick/add-pr-comment@v2.8.2
         with:
           issue: ${{ inputs.pr_number }}
           message-id: alpha-release-${{ steps.alpha.outputs.tag }}
@@ -138,14 +175,17 @@ jobs:
 
             ### Test in infra-stacks
 
-            Update `vendor.yaml` or catalog source version:
+            Update the component source version in your stack file:
             ```yaml
-            version: "${{ steps.alpha.outputs.tag }}"
+            components:
+              terraform:
+                ${{ steps.repo.outputs.component }}:
+                  source:
+                    version: "${{ steps.alpha.outputs.tag }}"
             ```
 
             Then run:
             ```bash
-            atmos vendor pull -c ${{ steps.repo.outputs.component }}
             atmos terraform plan ${{ steps.repo.outputs.component }} -s <stage>
             ```
 
