@@ -5,7 +5,7 @@ on:
 
 env:
   SEMANTIC_RELEASE_VERSION: '24.2.0'
-  NODE_VERSION: '20.11.0'
+  NODE_VERSION: '22'
 
 jobs:
   preview:
@@ -17,14 +17,14 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.ref }}
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -99,7 +99,7 @@ jobs:
 
       - name: Comment on PR
         if: github.event_name == 'pull_request'
-        uses: mshick/add-pr-comment@v2
+        uses: mshick/add-pr-comment@v2.8.2
         with:
           message-id: release-preview
           message: |
