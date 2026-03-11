@@ -79,14 +79,14 @@ jobs:
         env:
           BASE_VERSION: ${{ steps.next-version.outputs.version }}
         run: |
-          # Find existing alpha tags for this version
-          EXISTING=$(git tag -l "v${BASE_VERSION}-alpha.*" | sort -V | tail -1 || echo "")
+          # Alpha tags use alpha/v<version>.<N> format to avoid polluting
+          # semantic-release's tag namespace (which matches v<semver>).
+          EXISTING=$(git tag -l "alpha/v${BASE_VERSION}.*" | sort -V | tail -1 || echo "")
 
           if [ -z "$EXISTING" ]; then
             ALPHA_NUM=1
           else
-            # Extract the alpha number and increment
-            ALPHA_NUM=$(echo "$EXISTING" | grep -Eo 'alpha\.[0-9]+' | grep -Eo '[0-9]+')
+            ALPHA_NUM=$(echo "$EXISTING" | grep -Eo '\.[0-9]+$' | grep -Eo '[0-9]+')
             if [ -z "$ALPHA_NUM" ] || ! [[ "$ALPHA_NUM" =~ ^[0-9]+$ ]]; then
               echo "::error::Could not parse alpha number from tag: $EXISTING"
               exit 1
@@ -94,7 +94,7 @@ jobs:
             ALPHA_NUM=$((ALPHA_NUM + 1))
           fi
 
-          ALPHA_TAG="v${BASE_VERSION}-alpha.${ALPHA_NUM}"
+          ALPHA_TAG="alpha/v${BASE_VERSION}.${ALPHA_NUM}"
           echo "tag=$ALPHA_TAG" >> $GITHUB_OUTPUT
           echo "num=$ALPHA_NUM" >> $GITHUB_OUTPUT
 
