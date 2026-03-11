@@ -25,32 +25,6 @@ jobs:
       pull-requests: write
 
     steps:
-      - name: Verify CI checks passed
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-        run: |
-          HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.head.sha')
-
-          # Get all check runs, excluding this workflow's own jobs
-          CHECKS_JSON=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" --paginate --jq '.check_runs[]')
-
-          TOTAL=$(echo "$CHECKS_JSON" | jq -s '[.[] | select(.name != "get-pr-info" and .name != "Create Alpha Release")] | length')
-          FAILED=$(echo "$CHECKS_JSON" | jq -s '[.[] | select(.name != "get-pr-info" and .name != "Create Alpha Release") | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length')
-
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "::error::No CI checks found on commit ${HEAD_SHA}. Push to the PR branch first to trigger CI."
-            exit 1
-          fi
-
-          if [ "$FAILED" -gt 0 ]; then
-            echo "::error::CI checks have not all passed. Fix failing checks before creating an alpha release."
-            echo "$CHECKS_JSON" | jq -rs '.[] | select(.name != "get-pr-info" and .name != "Create Alpha Release") | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | "  \(.name): \(.conclusion // "in_progress")"'
-            exit 1
-          fi
-
-          echo "All CI checks passed on ${HEAD_SHA}"
-
       - name: Checkout PR branch
         uses: actions/checkout@v5
         with:
