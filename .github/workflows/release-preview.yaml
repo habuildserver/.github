@@ -28,6 +28,14 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Remove pre-release tags
+        run: |
+          # Delete alpha/beta/rc tags locally so semantic-release only
+          # compares against stable releases when previewing
+          for tag in $(git tag -l '*-alpha.*' '*-beta.*' '*-rc.*'); do
+            git tag -d "$tag" >/dev/null 2>&1 || true
+          done
+
       - name: Run semantic-release (dry-run)
         id: semantic
         env:
