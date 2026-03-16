@@ -15,6 +15,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # semantic-release comments on issues/PRs referenced in commit messages
+      issues: write
 
     steps:
       - name: Checkout
