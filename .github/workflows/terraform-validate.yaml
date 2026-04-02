@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: write
 
     steps:
       - name: Checkout code
@@ -28,30 +29,33 @@ jobs:
         run: tflint --init
 
       - name: Terraform Format Check
-        id: fmt
+        id: fmt-check
         run: |
           echo "Checking Terraform formatting..."
           terraform fmt -check -recursive src/
         continue-on-error: true
 
       - name: Terraform Format Results
-        if: steps.fmt.outcome == 'failure'
+        if: steps.fmt-check.outcome == 'failure'
         run: |
           echo "Terraform formatting issues found!"
           echo "Run 'terraform fmt -recursive src/' to fix"
           exit 1
 
       - name: Validate Terraform
+        id: validate
         working-directory: src
         run: |
           terraform init -backend=false
           terraform validate
 
       - name: Lint Terraform
+        id: lint
         working-directory: src
         run: tflint --config="${GITHUB_WORKSPACE}/.tflint.hcl"
 
       - name: Terraform Tests
+        id: tests
         working-directory: src
         run: |
           if ls tests/*.tftest.hcl 2>/dev/null || ls *.tftest.hcl 2>/dev/null; then
@@ -61,9 +65,66 @@ jobs:
           fi
 
       - name: Run Checkov
+        id: checkov
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: src
           framework: terraform
           quiet: true
           config_file: .checkov.yml
+
+      - name: Post failure comment to PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            const failures = [];
+            if ('${{ steps.fmt-check.outcome }}' === 'failure') failures.push('Terraform Format (`terraform fmt -check`)');
+            if ('${{ steps.validate.outcome }}' === 'failure') failures.push('Terraform Validate');
+            if ('${{ steps.lint.outcome }}' === 'failure') failures.push('TFLint');
+            if ('${{ steps.tests.outcome }}' === 'failure') failures.push('Terraform Tests');
+            if ('${{ steps.checkov.outcome }}' === 'failure') failures.push('Checkov Security Scan');
+
+            const failureList = failures.length > 0
+              ? failures.map(f => `- ❌ ${f}`).join('\n')
+              : '- ❌ Check the workflow run for details';
+
+            const body = [
+              '### ❌ Terraform Validation Failed',
+              '',
+              failureList,
+              '',
+              `[View full workflow run](${runUrl})`,
+              '',
+              '---',
+              '*CI-generated Terraform validation report.*'
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Terraform Validation')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
