@@ -29,14 +29,14 @@ jobs:
         run: tflint --init
 
       - name: Terraform Format Check
-        id: fmt-check
+        id: fmt
         run: |
           echo "Checking Terraform formatting..."
           terraform fmt -check -recursive src/
         continue-on-error: true
 
       - name: Terraform Format Results
-        if: steps.fmt-check.outcome == 'failure'
+        if: steps.fmt.outcome == 'failure'
         run: |
           echo "Terraform formatting issues found!"
           echo "Run 'terraform fmt -recursive src/' to fix"
@@ -82,7 +82,7 @@ jobs:
             const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
 
             const failures = [];
-            if ('${{ steps.fmt-check.outcome }}' === 'failure') failures.push('Terraform Format (`terraform fmt -check`)');
+            if ('${{ steps.fmt.outcome }}' === 'failure') failures.push('Terraform Format (`terraform fmt -check`)');
             if ('${{ steps.validate.outcome }}' === 'failure') failures.push('Terraform Validate');
             if ('${{ steps.lint.outcome }}' === 'failure') failures.push('TFLint');
             if ('${{ steps.tests.outcome }}' === 'failure') failures.push('Terraform Tests');
