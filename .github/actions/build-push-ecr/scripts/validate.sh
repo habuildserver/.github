@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Validates inputs for the build-push-ecr workflow.
+# Validates inputs for the build-push-ecr action.
 # Expected env vars: SERVICE_NAME, ENVIRONMENT, AWS_ACCOUNT_ID, INPUT_DOCKERFILE, INPUT_CONTEXT
 
 if [[ ! "$SERVICE_NAME" =~ ^[a-z][a-z0-9-]+$ ]]; then

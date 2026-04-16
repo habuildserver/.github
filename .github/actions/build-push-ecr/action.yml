@@ -1,0 +1,189 @@
+# Composite action — builds a Docker image and pushes to ECR.
+# Tags with git SHA (for K8s/ArgoCD) and `latest` (for ECS backwards compat).
+# Uses BuildKit with GHA cache for fast, cached builds.
+#
+# Usage:
+#
+#   - uses: habuildserver/.github/.github/actions/build-push-ecr@main
+#     with:
+#       service-name: chat-service
+#       environment: development
+#       aws-account-id: '963127282571'
+#       sdk-token: ${{ secrets.SDK_TOKEN }}
+#
+# Rollback (ECS):    Re-run for the desired commit, or re-tag a previous SHA as latest.
+# Rollback (K8s):    Revert the gitops manifest to the previous SHA tag.
+
+name: Build & Push to ECR
+description: Builds a Docker image, tags with git SHA + latest, pushes to ECR
+
+inputs:
+  service-name:
+    description: 'ECR repository name (e.g., chat-service)'
+    required: true
+  environment:
+    description: 'Target environment (development, staging, production)'
+    required: true
+    default: 'development'
+  dockerfile:
+    description: 'Path to Dockerfile (default: build/Dockerfile-<environment>)'
+    required: false
+  context:
+    description: 'Docker build context (default: .)'
+    required: false
+    default: '.'
+  aws-region:
+    description: 'AWS region'
+    required: false
+    default: 'ap-south-1'
+  aws-account-id:
+    description: 'AWS account ID for ECR (differs per environment)'
+    required: true
+  use-submodules:
+    description: 'Checkout with recursive submodules (true/false)'
+    required: false
+    default: 'false'
+  extra-build-args:
+    description: 'Additional docker build args (one per line, KEY=value format)'
+    required: false
+    default: ''
+  notify-clickup:
+    description: 'Send deploy notification to ClickUp (true/false)'
+    required: false
+    default: 'true'
+  # Secrets passed as inputs (GitHub still masks them in logs)
+  sdk-token:
+    description: 'GitHub Packages token for private npm'
+    required: false
+  common-token:
+    description: 'PAT for submodule checkout'
+    required: false
+  clickup-token:
+    description: 'ClickUp API token'
+    required: false
+  clickup-workspace-id:
+    description: 'ClickUp workspace ID'
+    required: false
+  clickup-channel-id:
+    description: 'ClickUp channel ID for notifications'
+    required: false
+
+outputs:
+  image-tag:
+    description: 'The full git SHA image tag that was pushed'
+    value: ${{ steps.meta.outputs.image-tag }}
+  image-uri:
+    description: 'Full image URI with SHA tag'
+    value: ${{ steps.meta.outputs.image-uri }}
+  short-sha:
+    description: 'Short (7-char) SHA tag'
+    value: ${{ steps.meta.outputs.short-sha }}
+  ecr-repo:
+    description: 'Full ECR repository URI (without tag)'
+    value: ${{ steps.meta.outputs.ecr-repo }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        SERVICE_NAME: ${{ inputs.service-name }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        INPUT_CONTEXT: ${{ inputs.context }}
+      run: ${{ github.action_path }}/scripts/validate.sh
+
+    - name: Set image metadata
+      id: meta
+      shell: bash
+      env:
+        SERVICE_NAME: ${{ inputs.service-name }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+        AWS_REGION: ${{ inputs.aws-region }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+      run: ${{ github.action_path }}/scripts/set-metadata.sh
+
+    - name: Configure AWS Credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+      with:
+        role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/github-actions-oidc-role
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+    - name: Ensure ECR repository exists
+      shell: bash
+      env:
+        REPO_NAME: ${{ inputs.service-name }}-${{ inputs.environment }}
+        SERVICE_NAME: ${{ inputs.service-name }}
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: ${{ github.action_path }}/scripts/ensure-ecr-repo.sh
+
+    - name: Check if image already exists
+      id: check-existing
+      shell: bash
+      env:
+        REPO_NAME: ${{ inputs.service-name }}-${{ inputs.environment }}
+      run: ${{ github.action_path }}/scripts/check-existing-image.sh
+
+    - name: Configure npm for private packages
+      if: steps.check-existing.outputs.exists != 'true' && inputs.sdk-token != ''
+      shell: bash
+      run: |
+        echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
+        echo "//npm.pkg.github.com/:_authToken=${{ inputs.sdk-token }}" >> ~/.npmrc
+
+    - name: Set up Docker Buildx
+      if: steps.check-existing.outputs.exists != 'true'
+      uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+    - name: Build and push
+      if: steps.check-existing.outputs.exists != 'true'
+      uses: docker/build-push-action@263435318d21b8e681c14492fe198e19c3bc4c94 # v6.18.0
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ steps.meta.outputs.dockerfile }}
+        push: true
+        tags: |
+          ${{ steps.meta.outputs.ecr-repo }}:${{ github.sha }}
+          ${{ steps.meta.outputs.ecr-repo }}:${{ steps.meta.outputs.short-sha }}
+          ${{ steps.meta.outputs.ecr-repo }}:latest
+        build-args: |
+          SDK_TOKEN=${{ inputs.sdk-token }}
+          ${{ inputs.extra-build-args }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          com.habuild.build.run-id=${{ github.run_id }}
+          com.habuild.build.run-url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    - name: Notify ClickUp (success)
+      if: success() && inputs.notify-clickup == 'true'
+      shell: bash
+      env:
+        CLICKUP_TOKEN: ${{ inputs.clickup-token }}
+        CLICKUP_WORKSPACE_ID: ${{ inputs.clickup-workspace-id }}
+        CLICKUP_CHANNEL_ID: ${{ inputs.clickup-channel-id }}
+        SERVICE_NAME: ${{ inputs.service-name }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        SHORT_SHA: ${{ steps.meta.outputs.short-sha }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: ${{ github.action_path }}/scripts/notify-clickup.sh success
+
+    - name: Notify ClickUp (failure)
+      if: failure() && inputs.notify-clickup == 'true'
+      shell: bash
+      env:
+        CLICKUP_TOKEN: ${{ inputs.clickup-token }}
+        CLICKUP_WORKSPACE_ID: ${{ inputs.clickup-workspace-id }}
+        CLICKUP_CHANNEL_ID: ${{ inputs.clickup-channel-id }}
+        SERVICE_NAME: ${{ inputs.service-name }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: ${{ github.action_path }}/scripts/notify-clickup.sh failure
