@@ -1,11 +1,12 @@
 # Reusable workflow — builds a Docker image and pushes to ECR.
-# Tags with both git SHA (for K8s/ArgoCD) and `latest` (for ECS).
+# Tags with git SHA (for K8s/ArgoCD) and `latest` (for ECS backwards compat).
+# Uses BuildKit with GHA cache for fast, cached builds.
 #
 # Supports:
 #   - Single-service repos (default)
 #   - Mono-repos with multiple services (set service-name + dockerfile)
 #   - Workers from the same repo (separate workflow call per worker)
-#   - Private npm packages via SDK_TOKEN build-arg
+#   - Private npm packages via BuildKit secret mount
 #   - Git submodules via COMMON_TOKEN
 #
 # Usage — single service:
@@ -27,16 +28,8 @@
 #       with:
 #         service-name: orchestration-service
 #         environment: development
+#         aws-account-id: '963127282571'
 #         dockerfile: orchestration-service/build/Dockerfile
-#         context: .
-#       secrets: inherit
-#
-#     build-provider:
-#       uses: habuildserver/.github/.github/workflows/build-push-ecr.yaml@main
-#       with:
-#         service-name: provider-service
-#         environment: development
-#         dockerfile: provider-service/build/Dockerfile
 #         context: .
 #       secrets: inherit
 #
@@ -48,8 +41,14 @@
 #       with:
 #         service-name: chat-worker
 #         environment: development
+#         aws-account-id: '963127282571'
 #         dockerfile: build/worker/Dockerfile-development
 #       secrets: inherit
+#
+# Rollback (ECS):
+#   Re-run the workflow for the desired commit, or re-tag a previous SHA image as latest.
+# Rollback (K8s/ArgoCD):
+#   Revert the gitops manifest to the previous SHA tag. ArgoCD self-heals.
 
 name: Reusable - Build & Push to ECR
 
@@ -83,18 +82,13 @@ on:
         description: 'AWS account ID for ECR (differs per environment)'
         required: true
         type: string
-      node-version:
-        description: 'Node.js version (for npm config)'
-        required: false
-        type: string
-        default: '22'
       use-submodules:
         description: 'Checkout with recursive submodules'
         required: false
         type: boolean
-        default: true
+        default: false
       extra-build-args:
-        description: 'Additional docker build args (one per line, e.g., "MY_ARG=value")'
+        description: 'Additional docker build args (one per line, KEY=value format)'
         required: false
         type: string
         default: ''
@@ -105,7 +99,7 @@ on:
         default: true
     outputs:
       image-tag:
-        description: 'The git SHA image tag that was pushed'
+        description: 'The full git SHA image tag that was pushed'
         value: ${{ jobs.build-push.outputs.image-tag }}
       image-uri:
         description: 'Full image URI with SHA tag'
@@ -122,17 +116,24 @@ on:
       CLICKUP_CHANNEL_ID:
         required: false
 
+permissions: {}
+
 jobs:
   build-push:
     name: Build & Push ${{ inputs.service-name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    concurrency:
+      group: ecr-push-${{ inputs.service-name }}-${{ inputs.environment }}-${{ github.ref }}
+      cancel-in-progress: true
 
     permissions:
       contents: read
       id-token: write
 
     outputs:
-      image-tag: ${{ steps.meta.outputs.sha-tag }}
+      image-tag: ${{ steps.meta.outputs.image-tag }}
       image-uri: ${{ steps.meta.outputs.image-uri }}
 
     env:
@@ -143,7 +144,11 @@ jobs:
 
     steps:
       - name: Validate inputs
+        env:
+          INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+          INPUT_CONTEXT: ${{ inputs.context }}
         run: |
+          set -euo pipefail
           if [[ ! "$SERVICE_NAME" =~ ^[a-z][a-z0-9-]+$ ]]; then
             echo "::error::Invalid service-name: must match ^[a-z][a-z0-9-]+$"
             exit 1
@@ -152,99 +157,155 @@ jobs:
             echo "::error::Invalid environment: must be development, staging, or production"
             exit 1
           fi
+          if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::Invalid aws-account-id: must be exactly 12 digits"
+            exit 1
+          fi
+          if [ -n "$INPUT_DOCKERFILE" ] && [[ ! "$INPUT_DOCKERFILE" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+            echo "::error::Invalid dockerfile path"
+            exit 1
+          fi
+          if [[ ! "$INPUT_CONTEXT" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+            echo "::error::Invalid context path"
+            exit 1
+          fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           token: ${{ secrets.COMMON_TOKEN || github.token }}
           submodules: ${{ inputs.use-submodules && 'recursive' || 'false' }}
 
       - name: Set image metadata
         id: meta
+        env:
+          INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
+          set -euo pipefail
           ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${SERVICE_NAME}-${ENVIRONMENT}"
-          SHA_TAG="${GITHUB_SHA:0:7}"
+          DOCKERFILE="${INPUT_DOCKERFILE:-build/Dockerfile-${ENVIRONMENT}}"
           echo "ecr-repo=${ECR_REPO}" >> "$GITHUB_OUTPUT"
-          echo "sha-tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
-          echo "full-sha-tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "image-uri=${ECR_REPO}:${SHA_TAG}" >> "$GITHUB_OUTPUT"
-          echo "dockerfile=${{ inputs.dockerfile || format('build/Dockerfile-{0}', inputs.environment) }}" >> "$GITHUB_OUTPUT"
+          echo "image-tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short-sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "image-uri=${ECR_REPO}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=${DOCKERFILE}" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS Credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
           role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Ensure ECR repository exists
+        env:
+          REPO_NAME: ${{ format('{0}-{1}', inputs.service-name, inputs.environment) }}
         run: |
-          aws ecr get-login-password --region "$AWS_REGION" | \
-            docker login --username AWS --password-stdin \
-            "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "$REPO_NAME" 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name "$REPO_NAME" \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256 \
+            --tags Key=Service,Value="${SERVICE_NAME}" Key=Environment,Value="${ENVIRONMENT}"
+
+      - name: Check if image already exists
+        id: check-existing
+        env:
+          REPO_NAME: ${{ format('{0}-{1}', inputs.service-name, inputs.environment) }}
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images --repository-name "$REPO_NAME" \
+             --image-ids imageTag="${GITHUB_SHA}" 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image ${GITHUB_SHA} already exists in ECR — skipping build"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Configure npm for private packages
-        if: ${{ secrets.SDK_TOKEN != '' }}
-        run: |
-          echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
-          echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
-
-      - name: Build Docker image
+        if: steps.check-existing.outputs.exists != 'true'
         env:
-          ECR_REPO: ${{ steps.meta.outputs.ecr-repo }}
-          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
-          FULL_SHA_TAG: ${{ steps.meta.outputs.full-sha-tag }}
-          DOCKERFILE: ${{ steps.meta.outputs.dockerfile }}
-          CONTEXT: ${{ inputs.context }}
           SDK_TOKEN: ${{ secrets.SDK_TOKEN }}
-          EXTRA_BUILD_ARGS: ${{ inputs.extra-build-args }}
         run: |
-          BUILD_ARGS=""
-          if [ -n "$SDK_TOKEN" ]; then
-            BUILD_ARGS="--build-arg SDK_TOKEN=${SDK_TOKEN}"
+          if [ -n "${SDK_TOKEN}" ]; then
+            echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
+            echo "//npm.pkg.github.com/:_authToken=${SDK_TOKEN}" >> ~/.npmrc
           fi
 
-          # Add any extra build args
-          if [ -n "$EXTRA_BUILD_ARGS" ]; then
-            while IFS= read -r arg; do
-              [ -n "$arg" ] && BUILD_ARGS="${BUILD_ARGS} --build-arg ${arg}"
-            done <<< "$EXTRA_BUILD_ARGS"
-          fi
+      - name: Set up Docker Buildx
+        if: steps.check-existing.outputs.exists != 'true'
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
-          docker build \
-            -f "$DOCKERFILE" \
-            $BUILD_ARGS \
-            -t "${ECR_REPO}:${SHA_TAG}" \
-            -t "${ECR_REPO}:${FULL_SHA_TAG}" \
-            -t "${ECR_REPO}:latest" \
-            "$CONTEXT"
+      - name: Build and push
+        if: steps.check-existing.outputs.exists != 'true'
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198e19c3bc4c94 # v6.18.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ steps.meta.outputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.ecr-repo }}:${{ github.sha }}
+            ${{ steps.meta.outputs.ecr-repo }}:${{ steps.meta.outputs.short-sha }}
+            ${{ steps.meta.outputs.ecr-repo }}:latest
+          build-args: |
+            SDK_TOKEN=${{ secrets.SDK_TOKEN }}
+            ${{ inputs.extra-build-args }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            com.habuild.build.run-id=${{ github.run_id }}
+            com.habuild.build.run-url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Push Docker image to ECR
-        env:
-          ECR_REPO: ${{ steps.meta.outputs.ecr-repo }}
-          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
-          FULL_SHA_TAG: ${{ steps.meta.outputs.full-sha-tag }}
-        run: |
-          docker push "${ECR_REPO}:${SHA_TAG}"
-          docker push "${ECR_REPO}:${FULL_SHA_TAG}"
-          docker push "${ECR_REPO}:latest"
-          echo "Pushed: ${ECR_REPO}:${SHA_TAG}"
-          echo "Pushed: ${ECR_REPO}:${FULL_SHA_TAG}"
-          echo "Pushed: ${ECR_REPO}:latest"
-
-      - name: Notify ClickUp
-        if: ${{ inputs.notify-clickup && secrets.CLICKUP_TOKEN != '' }}
+      - name: Notify ClickUp (success)
+        if: success() && inputs.notify-clickup
         env:
           CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
           CLICKUP_WORKSPACE_ID: ${{ secrets.CLICKUP_WORKSPACE_ID }}
           CLICKUP_CHANNEL_ID: ${{ secrets.CLICKUP_CHANNEL_ID }}
-          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          SHORT_SHA: ${{ steps.meta.outputs.short-sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -s -X POST \
+          [ -z "$CLICKUP_TOKEN" ] && exit 0
+          BODY=$(jq -n \
+            --arg svc "$SERVICE_NAME" \
+            --arg env "$ENVIRONMENT" \
+            --arg sha "$SHORT_SHA" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg url "$RUN_URL" \
+            '{type: "message", content_format: "text/md",
+              content: "Built and pushed **\($svc)** (\($env))\nImage tags: `\($sha)`, `latest`\nBranch: **\($branch)**\nTriggered by: **\($actor)**\n[View run](\($url))"}')
+          curl -sf -X POST \
             "https://api.clickup.com/api/v3/workspaces/${CLICKUP_WORKSPACE_ID}/chat/channels/${CLICKUP_CHANNEL_ID}/messages" \
             -H "Authorization: ${CLICKUP_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"type\": \"message\",
-              \"content_format\": \"text/md\",
-              \"content\": \"✅ Built and pushed **${SERVICE_NAME}** (${ENVIRONMENT})\n📦 Image tags: \`${SHA_TAG}\`, \`latest\`\n🔀 Branch: **${GITHUB_REF_NAME}**\n👤 Triggered by: **${GITHUB_ACTOR}**\"
-            }" || echo "::warning::ClickUp notification failed (non-blocking)"
+            -d "$BODY" || echo "::warning::ClickUp notification failed (HTTP error)"
+
+      - name: Notify ClickUp (failure)
+        if: failure() && inputs.notify-clickup
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_WORKSPACE_ID: ${{ secrets.CLICKUP_WORKSPACE_ID }}
+          CLICKUP_CHANNEL_ID: ${{ secrets.CLICKUP_CHANNEL_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -z "$CLICKUP_TOKEN" ] && exit 0
+          BODY=$(jq -n \
+            --arg svc "$SERVICE_NAME" \
+            --arg env "$ENVIRONMENT" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg url "$RUN_URL" \
+            '{type: "message", content_format: "text/md",
+              content: "FAILED build **\($svc)** (\($env))\nBranch: **\($branch)**\nTriggered by: **\($actor)**\n[View run](\($url))"}')
+          curl -sf -X POST \
+            "https://api.clickup.com/api/v3/workspaces/${CLICKUP_WORKSPACE_ID}/chat/channels/${CLICKUP_CHANNEL_ID}/messages" \
+            -H "Authorization: ${CLICKUP_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" || echo "::warning::ClickUp failure notification failed"
