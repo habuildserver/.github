@@ -6,7 +6,7 @@
 #   - Single-service repos (default)
 #   - Mono-repos with multiple services (set service-name + dockerfile)
 #   - Workers from the same repo (separate workflow call per worker)
-#   - Private npm packages via BuildKit secret mount
+#   - Private npm packages via SDK_TOKEN build-arg
 #   - Git submodules via COMMON_TOKEN
 #
 # Usage — single service:
@@ -143,52 +143,31 @@ jobs:
       AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
 
     steps:
+      - name: Checkout .github repo (for scripts)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: habuildserver/.github
+          path: .github-repo
+          sparse-checkout: .github/scripts/build-push
+
       - name: Validate inputs
         env:
           INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
           INPUT_CONTEXT: ${{ inputs.context }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$SERVICE_NAME" =~ ^[a-z][a-z0-9-]+$ ]]; then
-            echo "::error::Invalid service-name: must match ^[a-z][a-z0-9-]+$"
-            exit 1
-          fi
-          if [[ ! "$ENVIRONMENT" =~ ^(development|staging|production)$ ]]; then
-            echo "::error::Invalid environment: must be development, staging, or production"
-            exit 1
-          fi
-          if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
-            echo "::error::Invalid aws-account-id: must be exactly 12 digits"
-            exit 1
-          fi
-          if [ -n "$INPUT_DOCKERFILE" ] && [[ ! "$INPUT_DOCKERFILE" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
-            echo "::error::Invalid dockerfile path"
-            exit 1
-          fi
-          if [[ ! "$INPUT_CONTEXT" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
-            echo "::error::Invalid context path"
-            exit 1
-          fi
+        run: .github-repo/.github/scripts/build-push/validate.sh
 
-      - name: Checkout
+      - name: Checkout service repo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           token: ${{ secrets.COMMON_TOKEN || github.token }}
           submodules: ${{ inputs.use-submodules && 'recursive' || 'false' }}
+          path: service
 
       - name: Set image metadata
         id: meta
         env:
           INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
-        run: |
-          set -euo pipefail
-          ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${SERVICE_NAME}-${ENVIRONMENT}"
-          DOCKERFILE="${INPUT_DOCKERFILE:-build/Dockerfile-${ENVIRONMENT}}"
-          echo "ecr-repo=${ECR_REPO}" >> "$GITHUB_OUTPUT"
-          echo "image-tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "short-sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-          echo "image-uri=${ECR_REPO}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "dockerfile=${DOCKERFILE}" >> "$GITHUB_OUTPUT"
+        run: .github-repo/.github/scripts/build-push/set-metadata.sh
 
       - name: Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
@@ -197,34 +176,18 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: ecr-login
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
       - name: Ensure ECR repository exists
         env:
           REPO_NAME: ${{ format('{0}-{1}', inputs.service-name, inputs.environment) }}
-        run: |
-          set -euo pipefail
-          aws ecr describe-repositories --repository-names "$REPO_NAME" 2>/dev/null || \
-          aws ecr create-repository \
-            --repository-name "$REPO_NAME" \
-            --image-scanning-configuration scanOnPush=true \
-            --encryption-configuration encryptionType=AES256 \
-            --tags Key=Service,Value="${SERVICE_NAME}" Key=Environment,Value="${ENVIRONMENT}"
+        run: .github-repo/.github/scripts/build-push/ensure-ecr-repo.sh
 
       - name: Check if image already exists
         id: check-existing
         env:
           REPO_NAME: ${{ format('{0}-{1}', inputs.service-name, inputs.environment) }}
-        run: |
-          set -euo pipefail
-          if aws ecr describe-images --repository-name "$REPO_NAME" \
-             --image-ids imageTag="${GITHUB_SHA}" 2>/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image ${GITHUB_SHA} already exists in ECR — skipping build"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: .github-repo/.github/scripts/build-push/check-existing-image.sh
 
       - name: Configure npm for private packages
         if: steps.check-existing.outputs.exists != 'true'
@@ -244,8 +207,8 @@ jobs:
         if: steps.check-existing.outputs.exists != 'true'
         uses: docker/build-push-action@263435318d21b8e681c14492fe198e19c3bc4c94 # v6.18.0
         with:
-          context: ${{ inputs.context }}
-          file: ${{ steps.meta.outputs.dockerfile }}
+          context: service/${{ inputs.context }}
+          file: service/${{ steps.meta.outputs.dockerfile }}
           push: true
           tags: |
             ${{ steps.meta.outputs.ecr-repo }}:${{ github.sha }}
@@ -270,22 +233,7 @@ jobs:
           CLICKUP_CHANNEL_ID: ${{ secrets.CLICKUP_CHANNEL_ID }}
           SHORT_SHA: ${{ steps.meta.outputs.short-sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          [ -z "$CLICKUP_TOKEN" ] && exit 0
-          BODY=$(jq -n \
-            --arg svc "$SERVICE_NAME" \
-            --arg env "$ENVIRONMENT" \
-            --arg sha "$SHORT_SHA" \
-            --arg branch "$GITHUB_REF_NAME" \
-            --arg actor "$GITHUB_ACTOR" \
-            --arg url "$RUN_URL" \
-            '{type: "message", content_format: "text/md",
-              content: "Built and pushed **\($svc)** (\($env))\nImage tags: `\($sha)`, `latest`\nBranch: **\($branch)**\nTriggered by: **\($actor)**\n[View run](\($url))"}')
-          curl -sf -X POST \
-            "https://api.clickup.com/api/v3/workspaces/${CLICKUP_WORKSPACE_ID}/chat/channels/${CLICKUP_CHANNEL_ID}/messages" \
-            -H "Authorization: ${CLICKUP_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$BODY" || echo "::warning::ClickUp notification failed (HTTP error)"
+        run: .github-repo/.github/scripts/build-push/notify-clickup.sh success
 
       - name: Notify ClickUp (failure)
         if: failure() && inputs.notify-clickup
@@ -294,18 +242,4 @@ jobs:
           CLICKUP_WORKSPACE_ID: ${{ secrets.CLICKUP_WORKSPACE_ID }}
           CLICKUP_CHANNEL_ID: ${{ secrets.CLICKUP_CHANNEL_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          [ -z "$CLICKUP_TOKEN" ] && exit 0
-          BODY=$(jq -n \
-            --arg svc "$SERVICE_NAME" \
-            --arg env "$ENVIRONMENT" \
-            --arg branch "$GITHUB_REF_NAME" \
-            --arg actor "$GITHUB_ACTOR" \
-            --arg url "$RUN_URL" \
-            '{type: "message", content_format: "text/md",
-              content: "FAILED build **\($svc)** (\($env))\nBranch: **\($branch)**\nTriggered by: **\($actor)**\n[View run](\($url))"}')
-          curl -sf -X POST \
-            "https://api.clickup.com/api/v3/workspaces/${CLICKUP_WORKSPACE_ID}/chat/channels/${CLICKUP_CHANNEL_ID}/messages" \
-            -H "Authorization: ${CLICKUP_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$BODY" || echo "::warning::ClickUp failure notification failed"
+        run: .github-repo/.github/scripts/build-push/notify-clickup.sh failure
