@@ -91,8 +91,8 @@ runs:
         SERVICE_NAME: ${{ inputs.service-name }}
         ENVIRONMENT: ${{ inputs.environment }}
         AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
-        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
-        INPUT_CONTEXT: ${{ inputs.context }}
+        DOCKERFILE_PATH: ${{ inputs.dockerfile }}
+        CONTEXT_PATH: ${{ inputs.context }}
       run: ${{ github.action_path }}/scripts/validate.sh
 
     - name: Set image metadata
@@ -103,7 +103,7 @@ runs:
         ENVIRONMENT: ${{ inputs.environment }}
         AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
         AWS_REGION: ${{ inputs.aws-region }}
-        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        DOCKERFILE_PATH: ${{ inputs.dockerfile }}
       run: ${{ github.action_path }}/scripts/set-metadata.sh
 
     - name: Configure AWS Credentials (OIDC)

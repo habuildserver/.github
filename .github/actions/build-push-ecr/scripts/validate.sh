@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Validates inputs for the build-push-ecr action.
-# Expected env vars: SERVICE_NAME, ENVIRONMENT, AWS_ACCOUNT_ID, INPUT_DOCKERFILE, INPUT_CONTEXT
+# Expected env vars: SERVICE_NAME, ENVIRONMENT, AWS_ACCOUNT_ID, DOCKERFILE_PATH, CONTEXT_PATH
 
 if [[ ! "$SERVICE_NAME" =~ ^[a-z][a-z0-9-]+$ ]]; then
   echo "::error::Invalid service-name: must match ^[a-z][a-z0-9-]+$"
@@ -19,12 +19,12 @@ if [[ ! "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
   exit 1
 fi
 
-if [ -n "${INPUT_DOCKERFILE:-}" ] && [[ ! "$INPUT_DOCKERFILE" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+if [ -n "${DOCKERFILE_PATH:-}" ] && [[ ! "$DOCKERFILE_PATH" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
   echo "::error::Invalid dockerfile path"
   exit 1
 fi
 
-if [[ ! "${INPUT_CONTEXT:-.}" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+if [[ ! "${CONTEXT_PATH:-.}" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
   echo "::error::Invalid context path"
   exit 1
 fi
