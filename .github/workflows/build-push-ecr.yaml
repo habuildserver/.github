@@ -1,0 +1,250 @@
+# Reusable workflow — builds a Docker image and pushes to ECR.
+# Tags with both git SHA (for K8s/ArgoCD) and `latest` (for ECS).
+#
+# Supports:
+#   - Single-service repos (default)
+#   - Mono-repos with multiple services (set service-name + dockerfile)
+#   - Workers from the same repo (separate workflow call per worker)
+#   - Private npm packages via SDK_TOKEN build-arg
+#   - Git submodules via COMMON_TOKEN
+#
+# Usage — single service:
+#
+#   jobs:
+#     build:
+#       uses: habuildserver/.github/.github/workflows/build-push-ecr.yaml@main
+#       with:
+#         service-name: chat-service
+#         environment: development
+#         aws-account-id: '963127282571'
+#       secrets: inherit
+#
+# Usage — mono-repo with multiple services:
+#
+#   jobs:
+#     build-orchestration:
+#       uses: habuildserver/.github/.github/workflows/build-push-ecr.yaml@main
+#       with:
+#         service-name: orchestration-service
+#         environment: development
+#         dockerfile: orchestration-service/build/Dockerfile
+#         context: .
+#       secrets: inherit
+#
+#     build-provider:
+#       uses: habuildserver/.github/.github/workflows/build-push-ecr.yaml@main
+#       with:
+#         service-name: provider-service
+#         environment: development
+#         dockerfile: provider-service/build/Dockerfile
+#         context: .
+#       secrets: inherit
+#
+# Usage — worker from same repo:
+#
+#   jobs:
+#     build-worker:
+#       uses: habuildserver/.github/.github/workflows/build-push-ecr.yaml@main
+#       with:
+#         service-name: chat-worker
+#         environment: development
+#         dockerfile: build/worker/Dockerfile-development
+#       secrets: inherit
+
+name: Reusable - Build & Push to ECR
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: 'ECR repository name (e.g., chat-service). Used as: <account>.dkr.ecr.<region>.amazonaws.com/<service-name>-<environment>'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment (development, staging, production)'
+        required: true
+        type: string
+        default: 'development'
+      dockerfile:
+        description: 'Path to Dockerfile (default: build/Dockerfile-<environment>)'
+        required: false
+        type: string
+      context:
+        description: 'Docker build context (default: .)'
+        required: false
+        type: string
+        default: '.'
+      aws-region:
+        description: 'AWS region'
+        required: false
+        type: string
+        default: 'ap-south-1'
+      aws-account-id:
+        description: 'AWS account ID for ECR (differs per environment)'
+        required: true
+        type: string
+      node-version:
+        description: 'Node.js version (for npm config)'
+        required: false
+        type: string
+        default: '22'
+      use-submodules:
+        description: 'Checkout with recursive submodules'
+        required: false
+        type: boolean
+        default: true
+      extra-build-args:
+        description: 'Additional docker build args (one per line, e.g., "MY_ARG=value")'
+        required: false
+        type: string
+        default: ''
+      notify-clickup:
+        description: 'Send deploy notification to ClickUp'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image-tag:
+        description: 'The git SHA image tag that was pushed'
+        value: ${{ jobs.build-push.outputs.image-tag }}
+      image-uri:
+        description: 'Full image URI with SHA tag'
+        value: ${{ jobs.build-push.outputs.image-uri }}
+    secrets:
+      SDK_TOKEN:
+        required: false
+      COMMON_TOKEN:
+        required: false
+      CLICKUP_TOKEN:
+        required: false
+      CLICKUP_WORKSPACE_ID:
+        required: false
+      CLICKUP_CHANNEL_ID:
+        required: false
+
+jobs:
+  build-push:
+    name: Build & Push ${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.sha-tag }}
+      image-uri: ${{ steps.meta.outputs.image-uri }}
+
+    env:
+      SERVICE_NAME: ${{ inputs.service-name }}
+      ENVIRONMENT: ${{ inputs.environment }}
+      AWS_REGION: ${{ inputs.aws-region }}
+      AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if [[ ! "$SERVICE_NAME" =~ ^[a-z][a-z0-9-]+$ ]]; then
+            echo "::error::Invalid service-name: must match ^[a-z][a-z0-9-]+$"
+            exit 1
+          fi
+          if [[ ! "$ENVIRONMENT" =~ ^(development|staging|production)$ ]]; then
+            echo "::error::Invalid environment: must be development, staging, or production"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.COMMON_TOKEN || github.token }}
+          submodules: ${{ inputs.use-submodules && 'recursive' || 'false' }}
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${SERVICE_NAME}-${ENVIRONMENT}"
+          SHA_TAG="${GITHUB_SHA:0:7}"
+          echo "ecr-repo=${ECR_REPO}" >> "$GITHUB_OUTPUT"
+          echo "sha-tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
+          echo "full-sha-tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image-uri=${ECR_REPO}:${SHA_TAG}" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=${{ inputs.dockerfile || format('build/Dockerfile-{0}', inputs.environment) }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" | \
+            docker login --username AWS --password-stdin \
+            "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+      - name: Configure npm for private packages
+        if: ${{ secrets.SDK_TOKEN != '' }}
+        run: |
+          echo "@habuildserver:registry=https://npm.pkg.github.com/" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
+
+      - name: Build Docker image
+        env:
+          ECR_REPO: ${{ steps.meta.outputs.ecr-repo }}
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          FULL_SHA_TAG: ${{ steps.meta.outputs.full-sha-tag }}
+          DOCKERFILE: ${{ steps.meta.outputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          SDK_TOKEN: ${{ secrets.SDK_TOKEN }}
+          EXTRA_BUILD_ARGS: ${{ inputs.extra-build-args }}
+        run: |
+          BUILD_ARGS=""
+          if [ -n "$SDK_TOKEN" ]; then
+            BUILD_ARGS="--build-arg SDK_TOKEN=${SDK_TOKEN}"
+          fi
+
+          # Add any extra build args
+          if [ -n "$EXTRA_BUILD_ARGS" ]; then
+            while IFS= read -r arg; do
+              [ -n "$arg" ] && BUILD_ARGS="${BUILD_ARGS} --build-arg ${arg}"
+            done <<< "$EXTRA_BUILD_ARGS"
+          fi
+
+          docker build \
+            -f "$DOCKERFILE" \
+            $BUILD_ARGS \
+            -t "${ECR_REPO}:${SHA_TAG}" \
+            -t "${ECR_REPO}:${FULL_SHA_TAG}" \
+            -t "${ECR_REPO}:latest" \
+            "$CONTEXT"
+
+      - name: Push Docker image to ECR
+        env:
+          ECR_REPO: ${{ steps.meta.outputs.ecr-repo }}
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+          FULL_SHA_TAG: ${{ steps.meta.outputs.full-sha-tag }}
+        run: |
+          docker push "${ECR_REPO}:${SHA_TAG}"
+          docker push "${ECR_REPO}:${FULL_SHA_TAG}"
+          docker push "${ECR_REPO}:latest"
+          echo "Pushed: ${ECR_REPO}:${SHA_TAG}"
+          echo "Pushed: ${ECR_REPO}:${FULL_SHA_TAG}"
+          echo "Pushed: ${ECR_REPO}:latest"
+
+      - name: Notify ClickUp
+        if: ${{ inputs.notify-clickup && secrets.CLICKUP_TOKEN != '' }}
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_WORKSPACE_ID: ${{ secrets.CLICKUP_WORKSPACE_ID }}
+          CLICKUP_CHANNEL_ID: ${{ secrets.CLICKUP_CHANNEL_ID }}
+          SHA_TAG: ${{ steps.meta.outputs.sha-tag }}
+        run: |
+          curl -s -X POST \
+            "https://api.clickup.com/api/v3/workspaces/${CLICKUP_WORKSPACE_ID}/chat/channels/${CLICKUP_CHANNEL_ID}/messages" \
+            -H "Authorization: ${CLICKUP_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"type\": \"message\",
+              \"content_format\": \"text/md\",
+              \"content\": \"✅ Built and pushed **${SERVICE_NAME}** (${ENVIRONMENT})\n📦 Image tags: \`${SHA_TAG}\`, \`latest\`\n🔀 Branch: **${GITHUB_REF_NAME}**\n👤 Triggered by: **${GITHUB_ACTOR}**\"
+            }" || echo "::warning::ClickUp notification failed (non-blocking)"
