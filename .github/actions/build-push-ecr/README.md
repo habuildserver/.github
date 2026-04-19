@@ -148,6 +148,41 @@ Repos are named `<service-name>-<environment>`:
 
 **K8s/ArgoCD:** Revert the gitops manifest to the previous SHA tag. ArgoCD self-heals automatically.
 
+## Service image requirements
+
+The action builds whatever Dockerfile you hand it — it cannot enforce that
+the resulting image is actually deployable to K8s. The archetype chart
+(`charts/services/web-service/` in the gitops repo) imposes constraints
+that your Dockerfile must honour. If it doesn't, the image builds
+successfully but crashes at pod start with opaque runtime errors
+(OCI mount failures, `EACCES` on scratch writes, etc.).
+
+Baseline constraints:
+
+1. **No env secrets in image layers.** Add a `.dockerignore` excluding
+   `.env*` (and typically `.git/`, tests, editor configs). `COPY . .`
+   without a `.dockerignore` will ship dev secrets to every environment.
+2. **Runs with a read-only rootfs.** Scratch space must come from an
+   explicit volume (`/tmp` emptyDir in the lib chart), not from writing
+   to `/app/` or `/var/`. Test locally with
+   `docker run --read-only --tmpfs /tmp <image>`.
+3. **No build-time migrations or integration tests.** `prisma migrate
+   deploy` belongs in a K8s `Job` at deploy time, not in a Dockerfile
+   `RUN`. Tests belong in CI before this action runs.
+4. **No `:latest`-only behaviour.** K8s consumers read the SHA tag
+   (`image-tag` / `image-uri` outputs). `:latest` is retained for
+   ECS backward compat during migration only.
+
+Full tactical detail — `.dockerignore` template, Dockerfile patches,
+verification checklist before enabling CSI file mount — lives in the
+gitops repo:
+
+> [`habuild-k8s-gitops/docs/runbooks/csi-file-mount-image-requirements.md`](https://github.com/habuildserver/habuild-k8s-gitops/blob/main/docs/runbooks/csi-file-mount-image-requirements.md)
+
+The strategic context (why these standards exist, enforcement-point
+mapping, per-service migration sequencing) is in the infra-plans Phase
+4 doc on [service image standards](https://github.com/habuildserver/infra-plans/blob/main/phases/04-full-migration/service-image-standards.html).
+
 ## Prerequisites
 
 - AWS OIDC role `github-actions-oidc-role` configured in the target account
