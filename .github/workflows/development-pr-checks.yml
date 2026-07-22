@@ -295,16 +295,3 @@ jobs:
           echo "⚠️ WARNING: Coverage threshold not met."
           echo "${{ steps.coverage.outputs.message }}"
         continue-on-error: true
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        if: github.event_name == 'push'
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
-          flags: unittests
-          name: ${{ inputs.service-name }}
-          fail_ci_if_error: true
-          verbose: true
-          override_branch: ${{ github.head_ref || github.ref_name }}
-          override_commit: ${{ github.event.pull_request.head.sha || github.sha }}
