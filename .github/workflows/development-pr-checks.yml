@@ -295,3 +295,17 @@ jobs:
           echo "⚠️ WARNING: Coverage threshold not met."
           echo "${{ steps.coverage.outputs.message }}"
         continue-on-error: true
+
+      - name: Configure AWS Credentials (OIDC)
+        if: steps.test-cov-pr.outcome == 'success'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::963127282571:role/github-actions-oidc-role
+          aws-region: ap-south-1
+
+      - name: Upload coverage report to S3
+        if: steps.test-cov-pr.outcome == 'success'
+        run: |
+          aws s3 cp pr-coverage-summary.json \
+            s3://testing-automation-report-bucket/codecov/${{ inputs.service-name }}/coverage-summary.json \
+            --region ap-south-1
