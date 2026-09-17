@@ -136,7 +136,7 @@ jobs:
           }
 
       - name: Comment on PR
-        uses: mshick/add-pr-comment@v2.8.2
+        uses: mshick/add-pr-comment@v3.0.1
         with:
           issue: ${{ inputs.pr_number }}
           message-id: alpha-release-${{ steps.alpha.outputs.tag }}

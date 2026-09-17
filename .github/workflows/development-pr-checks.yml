@@ -43,7 +43,7 @@ jobs:
 
     steps:
       - name: Checkout code (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.COMMON_TOKEN }}
           submodules: recursive
@@ -53,7 +53,7 @@ jobs:
         run: ls -R src/app/common || echo "No common folder!"
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
@@ -252,7 +252,7 @@ jobs:
           echo "message=$MESSAGE" >> $GITHUB_OUTPUT
 
       - name: Post Coverage Comment to PR
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         if: github.event_name == 'pull_request' && steps.test-cov-pr.outcome == 'success'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -298,10 +298,12 @@ jobs:
 
       - name: Configure AWS Credentials (OIDC)
         if: steps.test-cov-pr.outcome == 'success' && github.base_ref == 'main'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::963127282571:role/github-actions-oidc-role
           aws-region: ap-south-1
+          # v6 defaults env-var->input translation ON; v4 had no such behaviour
+          translate-env-variables: false
 
       - name: Upload coverage report to S3
         if: steps.test-cov-pr.outcome == 'success' && github.base_ref == 'main'
