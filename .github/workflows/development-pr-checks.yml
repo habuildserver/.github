@@ -23,7 +23,7 @@ on:
       SDK_TOKEN:
         required: true
       CODECOV_TOKEN:
-        required: false
+        required: true
       COMMON_TOKEN:
         required: true
 
@@ -56,18 +56,16 @@ jobs:
           token: ${{ secrets.COMMON_TOKEN }}
           submodules: recursive
           fetch-depth: 0
+      
+      - name: Debug common folder
+        run: ls -R src/app/common || echo "No common folder!"
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-
-      - name: Restore node_modules
-        id: node-modules
-        uses: actions/cache@v4
-        with:
-          path: ${{ inputs.working-directory }}/node_modules
-          key: node-modules-${{ runner.os }}-node${{ inputs.node-version }}-${{ hashFiles('**/package-lock.json', '**/*.prisma', '!**/node_modules/**') }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
 
       - name: Configure npm for private packages
         run: |
@@ -75,8 +73,7 @@ jobs:
           echo "//npm.pkg.github.com/:_authToken=${{ secrets.SDK_TOKEN }}" >> ~/.npmrc
 
       - name: Install dependencies
-        if: steps.node-modules.outputs.cache-hit != 'true'
-        run: npm ci --prefer-offline --no-audit --no-fund
+        run: npm ci
 
       - name: Check for package vulnerabilities
         id: audit
@@ -86,7 +83,6 @@ jobs:
         continue-on-error: true
 
       - name: Run linting on changed files
-        if: github.event_name == 'pull_request'
         run: |
           CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
 
@@ -98,12 +94,12 @@ jobs:
           echo "Linting changed files:"
           echo "$CHANGED_FILES"
 
+          # Convert to absolute paths
           ABS_PATHS=$(echo "$CHANGED_FILES" | sed "s|^|${{ github.workspace }}/|")
 
           npx eslint $ABS_PATHS
 
       - name: Check code formatting on changed files
-        if: github.event_name == 'pull_request'
         run: |
           CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
 
@@ -115,43 +111,52 @@ jobs:
           echo "Checking formatting on changed files:"
           echo "$CHANGED_FILES"
 
+          # Convert relative paths to absolute paths
           ABS_PATHS=$(echo "$CHANGED_FILES" | sed "s|^|${{ github.workspace }}/|")
 
           npx prettier --check $ABS_PATHS
 
-      - name: Run tests with coverage
+          if [ $? -ne 0 ]; then
+            echo "❌ Code is not properly formatted. Run 'npm run format' locally."
+            exit 1
+          else
+            echo "✅ Code is properly formatted"
+          fi
+
+      - name: Run tests with coverage (PR)
         id: test-cov-pr
         run: npm run test:cov
-
-      - name: Save PR coverage report
-        run: mv coverage/coverage-summary.json pr-coverage-summary.json
-
-      - name: Stage branch coverage baseline
-        if: github.event_name == 'push'
-        run: mkdir -p .coverage-baseline && cp pr-coverage-summary.json .coverage-baseline/coverage-summary.json
+        continue-on-error: false
 
       - name: Save branch coverage baseline
         if: github.event_name == 'push'
         uses: actions/cache/save@v4
         with:
-          path: ${{ inputs.working-directory }}/.coverage-baseline
+          path: ${{ inputs.working-directory }}/coverage/coverage-summary.json
           key: coverage-baseline-${{ inputs.service-name }}-${{ github.ref_name }}-${{ github.sha }}
+
+      - name: Save PR coverage report
+        if: steps.test-cov-pr.outcome == 'success'
+        run: mv coverage/coverage-summary.json pr-coverage-summary.json
 
       - name: Restore base branch coverage baseline
         if: github.event_name == 'pull_request'
         uses: actions/cache/restore@v4
         with:
-          path: ${{ inputs.working-directory }}/.coverage-baseline
+          path: ${{ inputs.working-directory }}/coverage/coverage-summary.json
           key: coverage-baseline-${{ inputs.service-name }}-${{ github.base_ref }}-none
           restore-keys: coverage-baseline-${{ inputs.service-name }}-${{ github.base_ref }}-
 
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
       - name: Parse Coverage Summaries
         id: coverage
-        if: github.event_name == 'pull_request'
+        if: steps.test-cov-pr.outcome == 'success'
         run: |
           THRESHOLD=80
           PR_SUMMARY_FILE="pr-coverage-summary.json"
-          BASE_SUMMARY_FILE=".coverage-baseline/coverage-summary.json"
+          BASE_SUMMARY_FILE="coverage/coverage-summary.json"
           
           if [ ! -f "$PR_SUMMARY_FILE" ]; then
             echo "❌ PR Coverage summary file not found!"
@@ -246,20 +251,20 @@ jobs:
 
           $THRESHOLD_WARNING
 
-          **Comparison with \`${{ github.base_ref }}\`:**
+          **Comparison with \`development\`:**
           $COMPARISON_MESSAGE
 
           $TABLE_BODY
 
           ---
-          *Baseline: latest \`${{ github.base_ref }}\` push run for **${{ inputs.service-name }}**.*"
+          *This is a CI-generated report for **${{ inputs.service-name }}** coverage. Data is also being sent to Codecov.*"
           
           echo "$COMMENT_BODY" > ${{ github.workspace }}/comment-body.md
           echo "message=$MESSAGE" >> $GITHUB_OUTPUT
 
       - name: Post Coverage Comment to PR
         uses: actions/github-script@v8
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.test-cov-pr.outcome == 'success'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -268,11 +273,10 @@ jobs:
             const commentBody = fs.readFileSync(path, 'utf8');
             const serviceName = '${{ inputs.service-name }}';
 
-            const comments = await github.paginate(github.rest.issues.listComments, {
+            const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              per_page: 100,
             });
             const botComment = comments.find(comment =>
               comment.user.login === 'github-actions[bot]' &&
@@ -304,9 +308,12 @@ jobs:
         continue-on-error: true
 
       - name: Write coverage to job summary
+        if: steps.test-cov-pr.outcome == 'success'
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          jq -r --arg ref "${{ github.event_name == 'pull_request' && format('PR #{0} → {1}', github.event.pull_request.number, github.base_ref) || github.ref_name }}" '
-            "### 📊 Coverage - ${{ inputs.service-name }} (\($ref) @ ${{ github.sha }})",
+          jq -r --arg branch "$BRANCH" '
+            "### 📊 Coverage - ${{ inputs.service-name }} (\($branch) @ ${{ github.sha }})",
             "| Category | Covered | Total | % |",
             "| --- | ---: | ---: | ---: |",
             (.total | to_entries[] | select(.key | IN("lines","statements","functions","branches"))
