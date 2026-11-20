@@ -31,6 +31,15 @@ jobs:
   lint-test-coverage:
     name: ESLint, Format & Test Coverage Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null))
+      || (github.event_name == 'push' && (github.ref_name == 'development' || github.ref_name == 'main'))
+      || github.event_name == 'workflow_dispatch'
+
+    concurrency:
+      group: pr-checks-${{ github.repository }}-${{ inputs.service-name }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
 
     defaults:
       run:
@@ -39,7 +48,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
 
     steps:
       - name: Checkout code (with submodules)
@@ -120,21 +128,24 @@ jobs:
         run: npm run test:cov
         continue-on-error: false
 
+      - name: Save branch coverage baseline
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ inputs.working-directory }}/coverage/coverage-summary.json
+          key: coverage-baseline-${{ inputs.service-name }}-${{ github.ref_name }}-${{ github.sha }}
+
       - name: Save PR coverage report
         if: steps.test-cov-pr.outcome == 'success'
         run: mv coverage/coverage-summary.json pr-coverage-summary.json
 
-      - name: Get development branch coverage
-        id: test-cov-dev
-        if: github.base_ref == 'development' && steps.test-cov-pr.outcome == 'success'
-        run: |
-          echo "Switching to development branch (TEMPORARY TEST)..."
-          git checkout development
-          npm ci
-          npm run test:cov
-          mv coverage/coverage-summary.json dev-coverage-summary.json
-          git checkout -
-        continue-on-error: true
+      - name: Restore base branch coverage baseline
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ inputs.working-directory }}/coverage/coverage-summary.json
+          key: coverage-baseline-${{ inputs.service-name }}-${{ github.base_ref }}-none
+          restore-keys: coverage-baseline-${{ inputs.service-name }}-${{ github.base_ref }}-
 
       - name: Install jq
         run: sudo apt-get install -y jq
@@ -145,7 +156,7 @@ jobs:
         run: |
           THRESHOLD=80
           PR_SUMMARY_FILE="pr-coverage-summary.json"
-          BASE_SUMMARY_FILE="dev-coverage-summary.json"
+          BASE_SUMMARY_FILE="coverage/coverage-summary.json"
           
           if [ ! -f "$PR_SUMMARY_FILE" ]; then
             echo "❌ PR Coverage summary file not found!"
@@ -296,18 +307,15 @@ jobs:
           echo "${{ steps.coverage.outputs.message }}"
         continue-on-error: true
 
-      - name: Configure AWS Credentials (OIDC)
-        if: steps.test-cov-pr.outcome == 'success' && github.base_ref == 'main'
-        uses: aws-actions/configure-aws-credentials@v6.3.0
-        with:
-          role-to-assume: arn:aws:iam::963127282571:role/github-actions-oidc-role
-          aws-region: ap-south-1
-          # v6.3.0 defaults env-var->input translation ON; v4 had no such behaviour
-          translate-env-variables: false
-
-      - name: Upload coverage report to S3
-        if: steps.test-cov-pr.outcome == 'success' && github.base_ref == 'main'
+      - name: Write coverage to job summary
+        if: steps.test-cov-pr.outcome == 'success'
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          aws s3 cp pr-coverage-summary.json \
-            s3://testing-automation-report-bucket/codecov/${{ inputs.service-name }}/coverage-summary.json \
-            --region ap-south-1
+          jq -r --arg branch "$BRANCH" '
+            "### 📊 Coverage - ${{ inputs.service-name }} (\($branch) @ ${{ github.sha }})",
+            "| Category | Covered | Total | % |",
+            "| --- | ---: | ---: | ---: |",
+            (.total | to_entries[] | select(.key | IN("lines","statements","functions","branches"))
+              | "| \(.key) | \(.value.covered) | \(.value.total) | \(.value.pct)% |")
+          ' pr-coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
