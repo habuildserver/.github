@@ -48,7 +48,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      id-token: write
 
     steps:
       - name: Checkout code (with submodules)
@@ -313,18 +312,3 @@ jobs:
             (.total | to_entries[] | select(.key | IN("lines","statements","functions","branches"))
               | "| \(.key) | \(.value.covered) | \(.value.total) | \(.value.pct)% |")
           ' pr-coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Configure AWS Credentials (OIDC)
-        if: github.event_name == 'push' && github.ref_name == 'main'
-        uses: aws-actions/configure-aws-credentials@v6.3.0
-        with:
-          role-to-assume: arn:aws:iam::963127282571:role/github-actions-oidc-role
-          aws-region: ap-south-1
-          translate-env-variables: false
-
-      - name: Upload coverage report to S3
-        if: github.event_name == 'push' && github.ref_name == 'main'
-        run: |
-          aws s3 cp pr-coverage-summary.json \
-            s3://testing-automation-report-bucket/codecov/${{ inputs.service-name }}/coverage-summary.json \
-            --region ap-south-1
