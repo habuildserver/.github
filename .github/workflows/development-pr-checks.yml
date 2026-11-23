@@ -48,6 +48,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      id-token: write
 
     steps:
       - name: Checkout code (with submodules)
@@ -83,6 +84,7 @@ jobs:
         continue-on-error: true
 
       - name: Run linting on changed files
+        if: github.event_name == 'pull_request'
         run: |
           CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
 
@@ -100,6 +102,7 @@ jobs:
           npx eslint $ABS_PATHS
 
       - name: Check code formatting on changed files
+        if: github.event_name == 'pull_request'
         run: |
           CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
 
@@ -140,6 +143,7 @@ jobs:
         run: mv coverage/coverage-summary.json pr-coverage-summary.json
 
       - name: Restore base branch coverage baseline
+        id: base-cov
         if: github.event_name == 'pull_request'
         uses: actions/cache/restore@v4
         with:
@@ -153,8 +157,11 @@ jobs:
       - name: Parse Coverage Summaries
         id: coverage
         if: steps.test-cov-pr.outcome == 'success'
+        env:
+          BASE_KEY: ${{ steps.base-cov.outputs.cache-matched-key }}
         run: |
           THRESHOLD=80
+          BASELINE_REF=""
           PR_SUMMARY_FILE="pr-coverage-summary.json"
           BASE_SUMMARY_FILE="coverage/coverage-summary.json"
           
@@ -186,6 +193,8 @@ jobs:
           TABLE_BODY=""
 
           if [ -f "$BASE_SUMMARY_FILE" ]; then
+            BASE_SHA="${BASE_KEY##*-}"
+            BASELINE_REF=" @ \`${BASE_SHA:0:7}\`"
             BASE_LINES_PCT=$(jq '.total.lines.pct' $BASE_SUMMARY_FILE)
             BASE_STATEMENTS_PCT=$(jq '.total.statements.pct' $BASE_SUMMARY_FILE)
             BASE_FUNCTIONS_PCT=$(jq '.total.functions.pct' $BASE_SUMMARY_FILE)
@@ -251,13 +260,13 @@ jobs:
 
           $THRESHOLD_WARNING
 
-          **Comparison with \`development\`:**
+          **Comparison with \`${{ github.base_ref }}\`${BASELINE_REF}:**
           $COMPARISON_MESSAGE
 
           $TABLE_BODY
 
           ---
-          *This is a CI-generated report for **${{ inputs.service-name }}** coverage. Data is also being sent to Codecov.*"
+          *This is a CI-generated report for **${{ inputs.service-name }}** coverage.*"
           
           echo "$COMMENT_BODY" > ${{ github.workspace }}/comment-body.md
           echo "message=$MESSAGE" >> $GITHUB_OUTPUT
@@ -313,9 +322,25 @@ jobs:
           BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           jq -r --arg branch "$BRANCH" '
-            "### 📊 Coverage - ${{ inputs.service-name }} (\($branch) @ ${{ github.sha }})",
+            "### 📊 Coverage - ${{ inputs.service-name }} (\($branch) @ ${{ github.event.pull_request.head.sha || github.sha }})",
             "| Category | Covered | Total | % |",
             "| --- | ---: | ---: | ---: |",
             (.total | to_entries[] | select(.key | IN("lines","statements","functions","branches"))
               | "| \(.key) | \(.value.covered) | \(.value.total) | \(.value.pct)% |")
           ' pr-coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure AWS Credentials (OIDC)
+        if: steps.test-cov-pr.outcome == 'success' && github.base_ref == 'main'
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::963127282571:role/github-actions-oidc-role
+          aws-region: ap-south-1
+          # v6.3.0 defaults env-var->input translation ON; v4 had no such behaviour
+          translate-env-variables: false
+
+      - name: Upload coverage report to S3
+        if: steps.test-cov-pr.outcome == 'success' && github.base_ref == 'main'
+        run: |
+          aws s3 cp pr-coverage-summary.json \
+            s3://testing-automation-report-bucket/codecov/${{ inputs.service-name }}/coverage-summary.json \
+            --region ap-south-1
