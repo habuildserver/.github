@@ -31,6 +31,15 @@ jobs:
   lint-test-coverage:
     name: ESLint, Format & Test Coverage Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: >-
+      (github.event_name == 'pull_request' && (github.event.action != 'edited' || github.event.changes.base != null))
+      || (github.event_name == 'push' && (github.ref_name == 'development' || github.ref_name == 'main'))
+      || github.event_name == 'workflow_dispatch'
+
+    concurrency:
+      group: pr-checks-${{ github.repository }}-${{ inputs.service-name }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
 
     defaults:
       run:
@@ -75,6 +84,7 @@ jobs:
         continue-on-error: true
 
       - name: Run linting on changed files
+        if: github.event_name == 'pull_request'
         run: |
           CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
 
@@ -92,6 +102,7 @@ jobs:
           npx eslint $ABS_PATHS
 
       - name: Check code formatting on changed files
+        if: github.event_name == 'pull_request'
         run: |
           CHANGED_FILES=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD | grep -E '\.(js|jsx|ts|tsx)$' || true)
 
@@ -120,21 +131,25 @@ jobs:
         run: npm run test:cov
         continue-on-error: false
 
+      - name: Save branch coverage baseline
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ inputs.working-directory }}/coverage/coverage-summary.json
+          key: coverage-baseline-${{ inputs.service-name }}-${{ github.ref_name }}-${{ github.sha }}
+
       - name: Save PR coverage report
         if: steps.test-cov-pr.outcome == 'success'
         run: mv coverage/coverage-summary.json pr-coverage-summary.json
 
-      - name: Get development branch coverage
-        id: test-cov-dev
-        if: github.base_ref == 'development' && steps.test-cov-pr.outcome == 'success'
-        run: |
-          echo "Switching to development branch (TEMPORARY TEST)..."
-          git checkout development
-          npm ci
-          npm run test:cov
-          mv coverage/coverage-summary.json dev-coverage-summary.json
-          git checkout -
-        continue-on-error: true
+      - name: Restore base branch coverage baseline
+        id: base-cov
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ inputs.working-directory }}/coverage/coverage-summary.json
+          key: coverage-baseline-${{ inputs.service-name }}-${{ github.base_ref }}-none
+          restore-keys: coverage-baseline-${{ inputs.service-name }}-${{ github.base_ref }}-
 
       - name: Install jq
         run: sudo apt-get install -y jq
@@ -142,10 +157,13 @@ jobs:
       - name: Parse Coverage Summaries
         id: coverage
         if: steps.test-cov-pr.outcome == 'success'
+        env:
+          BASE_KEY: ${{ steps.base-cov.outputs.cache-matched-key }}
         run: |
           THRESHOLD=80
+          BASELINE_REF=""
           PR_SUMMARY_FILE="pr-coverage-summary.json"
-          BASE_SUMMARY_FILE="dev-coverage-summary.json"
+          BASE_SUMMARY_FILE="coverage/coverage-summary.json"
           
           if [ ! -f "$PR_SUMMARY_FILE" ]; then
             echo "❌ PR Coverage summary file not found!"
@@ -175,6 +193,8 @@ jobs:
           TABLE_BODY=""
 
           if [ -f "$BASE_SUMMARY_FILE" ]; then
+            BASE_SHA="${BASE_KEY##*-}"
+            BASELINE_REF=" @ \`${BASE_SHA:0:7}\`"
             BASE_LINES_PCT=$(jq '.total.lines.pct' $BASE_SUMMARY_FILE)
             BASE_STATEMENTS_PCT=$(jq '.total.statements.pct' $BASE_SUMMARY_FILE)
             BASE_FUNCTIONS_PCT=$(jq '.total.functions.pct' $BASE_SUMMARY_FILE)
@@ -240,13 +260,13 @@ jobs:
 
           $THRESHOLD_WARNING
 
-          **Comparison with \`development\`:**
+          **Comparison with \`${{ github.base_ref }}\`${BASELINE_REF}:**
           $COMPARISON_MESSAGE
 
           $TABLE_BODY
 
           ---
-          *This is a CI-generated report for **${{ inputs.service-name }}** coverage. Data is also being sent to Codecov.*"
+          *This is a CI-generated report for **${{ inputs.service-name }}** coverage.*"
           
           echo "$COMMENT_BODY" > ${{ github.workspace }}/comment-body.md
           echo "message=$MESSAGE" >> $GITHUB_OUTPUT
@@ -295,6 +315,19 @@ jobs:
           echo "⚠️ WARNING: Coverage threshold not met."
           echo "${{ steps.coverage.outputs.message }}"
         continue-on-error: true
+
+      - name: Write coverage to job summary
+        if: steps.test-cov-pr.outcome == 'success'
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          jq -r --arg branch "$BRANCH" '
+            "### 📊 Coverage - ${{ inputs.service-name }} (\($branch) @ ${{ github.event.pull_request.head.sha || github.sha }})",
+            "| Category | Covered | Total | % |",
+            "| --- | ---: | ---: | ---: |",
+            (.total | to_entries[] | select(.key | IN("lines","statements","functions","branches"))
+              | "| \(.key) | \(.value.covered) | \(.value.total) | \(.value.pct)% |")
+          ' pr-coverage-summary.json >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure AWS Credentials (OIDC)
         if: steps.test-cov-pr.outcome == 'success' && github.base_ref == 'main'
